@@ -1,0 +1,40 @@
+{
+  "rootDir": "C:/usr/mcp/local-access",
+  "host": "0.0.0.0",
+  "port": 8000,
+  "readOnly": false,
+  "jsonResponse": false,
+  "rulesFile": "Rules.md",
+  "logDir": "logs",
+  "audit": true,
+  "maxCommandTimeout": 600,
+
+  "permissions": {
+    "defaultMode": "allow",
+    "allow": [
+      "List(**)",
+      "Read(**)",
+      "Edit(**)",
+      "Create(**)",
+      "Delete(**)",
+      "Run(npm run dev)",
+      "Run(npm run build)",
+      "Run(npm install)",
+      "Run(git status)",
+      "Run(git diff*)",
+      "Run(python *)",
+      "Run(pytest*)"
+    ],
+    "deny": [
+      "*(**/.env)",
+      "*(**/.env.*)",
+      "*(**/config.json)",
+      "*(**/secrets/**)",
+      "*(**/*.pem)",
+      "*(**/*.key)",
+      "Edit(**/.git/**)",
+      "Create(**/.git/**)",
+      "Delete(**/.git/**)"
+    ]
+  }
+}
