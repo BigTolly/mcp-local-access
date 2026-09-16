@@ -30,13 +30,14 @@ tested only on Windows; the macOS/Linux branches are written but not verified.
 5. [Configuration](#5-configuration)
 6. [Running and publishing](#6-running-and-publishing)
 7. [Connecting a client](#7-connecting-a-client)
-8. [Tools](#8-tools)
-9. [Rules.md — a guide to the project](#9-rulesmd--a-short-description-of-your-project)
-10. [Permissions](#11-permissions)
-11. [Limits](#11-limits)
-12. [Security](#12-security)
-13. [Troubleshooting](#13-troubleshooting)
-14. [FAQ](#14-faq)
+8. [JSON setup, using accio.com as an example](#8-json-setup-using-acciocom-as-an-example)
+9. [Tools](#9-tools)
+10. [Rules.md — a short description of your project](#10-rulesmd--a-short-description-of-your-project)
+11. [Permissions](#11-permissions)
+12. [Limits](#12-limits)
+13. [Security](#13-security)
+14. [Troubleshooting](#14-troubleshooting)
+15. [FAQ](#15-faq)
 
 ---
 
@@ -270,7 +271,39 @@ the client once and survives restarts of both the server and the proxy.
 - URL: `https://your-address/mcp` — the `/mcp` suffix is mandatory
 - Authentication: Bearer token, prefix `Bearer`, the token itself — from terminal 1
 
-## 8. Tools
+## 8. JSON setup, using accio.com as an example
+
+Some services let you add an MCP server as a single JSON block instead of
+filling in form fields. In accio.com, for example: Settings → MCP → the
+**Custom** section → the **Add custom MCP** button (or “+ Add”) → the
+**Add Custom MCP Server** dialog. The dialog has four Configuration Mode tabs:
+`JSON | Stdio (Local) | HTTP | SSE`. Open the **JSON** tab and paste this text:
+
+```json
+{
+  "mcpServers": {
+    "Local Access": {
+      "type": "http",
+      "url": "https://your-host.example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_TOKEN"
+      }
+    }
+  }
+}
+```
+
+Then replace the default values with your own:
+
+- `url` — the address of your tunnel or domain; the `/mcp` suffix is mandatory
+- `Authorization` — the `Bearer` prefix and your token (`MCP_TOKEN` from `.env`,
+  the server prints it on startup)
+
+The `Local Access` key is just the connection name shown in the interface, so
+you can change it. The same JSON works with any client that accepts an
+`mcpServers` configuration.
+
+## 9. Tools
 
 All paths in the arguments are relative to `rootDir`. Absolute paths are
 rejected, as are symlinks leading outside the root.
@@ -382,7 +415,7 @@ The journal is a sliding tail, not an archive: it is trimmed to the last 300 lin
 indefinitely. Command logs are cleaned separately: on start every
 `logs/cmd-NNN.log` whose process is neither alive nor adopted is deleted.
 
-## 9. Rules.md — a short description of your project
+## 10. Rules.md — a short description of your project
 
 `Rules.md` is an (optional) file; describe your project briefly in it,
 or you can point to the documentation files of your project.
@@ -495,7 +528,7 @@ An example whitelist: read only `src` and Markdown, write only to
 }
 ```
 
-## 11. Limits
+## 12. Limits
 
 Hardcoded in `server.py` (constants at the top of the file), changed by editing the code:
 
@@ -512,7 +545,7 @@ Hardcoded in `server.py` (constants at the top of the file), changed by editing 
 | `audit.log` | last 300 lines |
 | `Rules.md` | 20,000 characters |
 
-## 12. Security
+## 13. Security
 
 - Anyone who has the public URL **and** the token can read, change and delete
   inside `rootDir` — everything that is not closed by the `deny` rules.
@@ -531,7 +564,7 @@ Hardcoded in `server.py` (constants at the top of the file), changed by editing 
 **If you need it stricter:** enable call confirmation on the client side, narrow
 `rootDir`, set `"readOnly": true` or remove all `Run` rules.
 
-## 13. Troubleshooting
+## 14. Troubleshooting
 
 | Symptom | Cause |
 | --- | --- |
@@ -550,7 +583,7 @@ Hardcoded in `server.py` (constants at the top of the file), changed by editing 
 | `command must be a single line` | Newlines separate commands; join the steps with `&&` |
 | `Absolute paths are not allowed` | That is by design: paths are relative to `rootDir` |
 
-## 14. FAQ
+## 15. FAQ
 
 **What if I want several rootDirs?**
 
@@ -600,7 +633,7 @@ option: keep `Edit`/`Create` for the working folder and forbid the rest through
 **Is Rules.md required?**
 
 No, the server works without it too. But with it you do not have to explain in every new
-conversation what this project is and how things are done in it. See section 9.
+conversation what this project is and how things are done in it. See section 10.
 
 **Does this work on macOS and Linux?**
 
