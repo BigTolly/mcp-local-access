@@ -8,7 +8,8 @@ Command tools : run_command, list_processes, check_process, stop_process
 Guide tool    : project_guide (Rules.md, also pushed with the first result)
 Transport: Streamable HTTP at /mcp
 Auth: Authorization: Bearer <MCP_TOKEN>
-Sandbox: everything is restricted to ROOT_DIR.
+File sandbox: ROOT_DIR plus explicitly granted external Read/Write directories.
+Shell commands are not filesystem-sandboxed.
 
 Commands run through the system shell, so "&&", "||" and "|" work. Every link
 of such a chain is matched against the Run(...) whitelist separately, and
@@ -35,7 +36,7 @@ import tempfile
 import threading
 import time
 from collections import deque
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 try:
     from dotenv import load_dotenv
@@ -198,25 +199,58 @@ COMMAND_TIMEOUT_CAP = max(1, int(CONFIG.get("maxCommandTimeout") or MAX_TIMEOUT)
 # ------------------------------------------------------------- sandboxing ---
 
 
-def resolve_path(raw: str) -> Path:
-    """Resolve a user-supplied relative path inside ROOT, or raise ValueError."""
+def is_absolute_path(value: str) -> bool:
+    return value.startswith("/") or bool(WINDOWS_ABS.match(value))
+
+
+def path_value(raw: str) -> str:
     value = (raw or ".").strip().replace("\\", "/")
-    if value.startswith("/") or value.startswith("//") or WINDOWS_ABS.match(raw or ""):
+    windows = PureWindowsPath(value)
+    if windows.drive and not windows.is_absolute():
+        raise ValueError("Drive-relative paths such as J:src are not allowed; use J:/src.")
+    if IS_WINDOWS and value.startswith("/") and not value.startswith("//"):
+        raise ValueError("Windows paths must include a drive or a complete UNC share.")
+    if value.startswith("//"):
+        unc_parts = value[2:].split("/")
+        if len(unc_parts) < 2 or not all(unc_parts[:2]) or unc_parts[0] in {"?", "."} or not windows.is_absolute():
+            raise ValueError("UNC paths must include a server and a share: //server/share/folder; device paths are not allowed.")
+    if IS_WINDOWS:
+        tail = value[2:] if WINDOWS_ABS.match(value) else value
+        if ":" in tail:
+            raise ValueError("Windows alternate data streams are not allowed.")
+    if not IS_WINDOWS and (windows.drive or value.startswith("//")):
+        raise ValueError("Windows drive/UNC paths require a Windows server; use an SMB mount path on Linux.")
+    return value
+
+
+def policy_path(raw: str) -> Path:
+    value = path_value(raw)
+    # Keep the lexical alias for deny checks. Resolve separately before granting access.
+    return Path(os.path.abspath(value if is_absolute_path(value) else ROOT / value))
+
+
+def external_matches(path: Path) -> list[tuple[str, Path, Path, str]]:
+    return [rule for rule in PERMISSIONS.get("external", []) if _is_within(path, rule[2])]
+
+
+def allowed_location(path: Path) -> bool:
+    real = path.resolve()
+    if _is_within(path, ROOT):
+        return _is_within(real, ROOT) or bool(external_matches(real))
+    # Compare canonical targets: mapped drives and UNC may spell the same location
+    # differently. A link back into ROOT is not an external grant.
+    return bool(external_matches(real))
+
+
+def resolve_path(raw: str) -> Path:
+    """Validate a relative project path or an explicitly granted external absolute path."""
+    candidate = policy_path(raw)
+    value = path_value(raw)
+    if is_absolute_path(value) and _is_within(candidate, ROOT):
+        raise ValueError("Absolute paths inside rootDir are not allowed; use a relative project path.")
+    if not allowed_location(candidate):
         raise ValueError(
-            f"Absolute paths are not allowed. Use a path relative to the project root. Got: {raw!r}"
-        )
-
-    candidate = (ROOT / value).resolve()
-
-    # Follow symlinks for existing paths so links pointing outside are caught.
-    probe = candidate
-    while not probe.exists() and probe != probe.parent:
-        probe = probe.parent
-    real_probe = probe.resolve()
-
-    if not _is_within(candidate, ROOT) or not _is_within(real_probe, ROOT):
-        raise ValueError(
-            f"Path escapes the allowed root directory. Allowed root: {ROOT}. Got: {raw!r}"
+            f"Path escapes the allowed root directory or external grants. Allowed root: {ROOT}. Got: {raw!r}"
         )
     return candidate
 
@@ -229,7 +263,7 @@ def rel(path: Path) -> str:
     try:
         return path.relative_to(ROOT).as_posix() or "."
     except ValueError:
-        return str(path)
+        return path.as_posix()
 
 
 def human_size(num: int) -> str:
@@ -259,6 +293,7 @@ KNOWN_TOOLS = {
     "CREATE": "create",
     "DELETE": "delete",
     "RUN": "run_command",
+    "WRITE": "external full file access",
 }
 RULE_RE = re.compile(r"^\s*([A-Za-z_*]+)\s*\((.*)\)\s*$", re.DOTALL)
 
@@ -354,11 +389,45 @@ def parse_rules(
         if tool == "RUN":
             commands.append((command_to_regex(match.group(2)), entry))
             continue
+        argument = match.group(2).strip().replace("\\", "/")
+        if kind == "allow" and PureWindowsPath(argument).drive and not is_absolute_path(argument):
+            fail(f"Drive-relative permission paths are not allowed: {entry!r}.")
+        if kind == "allow" and is_absolute_path(argument):
+            if tool not in {"READ", "WRITE"}:
+                fail(f"External allow rules must use Read or Write: {entry!r}.")
+            # External grants are parsed separately, never as relative glob permissions.
+            continue
+        if tool == "WRITE" and kind == "allow":
+            fail(f"Write requires an absolute external directory: {entry!r}.")
         # deny rules also hide the directory itself, allow rules do not
-        patterns = compile_patterns([match.group(2)]) if kind == "deny" else [glob_to_regex(match.group(2))]
+        patterns = compile_patterns([argument]) if kind == "deny" else [glob_to_regex(argument)]
         for pattern in patterns:
             parsed.append((tool, pattern, entry))
     return parsed, commands
+
+
+def parse_external_rules(entries: list) -> list[tuple[str, Path, Path, str]]:
+    grants = []
+    for entry in entries:
+        match = RULE_RE.match(entry)
+        tool, value = match.group(1).upper(), match.group(2).strip().replace("\\", "/")
+        if tool not in {"READ", "WRITE"} or not is_absolute_path(value):
+            continue
+        if value.endswith("/**"):
+            value = value[:-3]
+        if any(char in value for char in "*?[]"):
+            fail(f"External grants require a concrete directory, optionally ending in /**: {entry!r}.")
+        try:
+            lexical = policy_path(value)
+            canonical = lexical.resolve()
+            if _is_within(lexical, ROOT) or _is_within(canonical, ROOT):
+                raise ValueError("Use relative permissions for directories inside rootDir.")
+            if canonical.exists() and not canonical.is_dir():
+                raise ValueError("An external grant must name a directory, not a file.")
+        except (OSError, RuntimeError, ValueError) as exc:
+            fail(f"Invalid external grant {entry!r}: {exc}")
+        grants.append((tool, lexical, canonical, entry))
+    return grants
 
 
 def load_permissions() -> dict:
@@ -386,6 +455,7 @@ def load_permissions() -> dict:
         "default": mode,
         "allow": allow_paths,
         "deny": deny_paths,
+        "external": parse_external_rules(allow),
         "allowRun": allow_commands,
         "denyRun": deny_commands,
         "raw": {"allow": allow, "deny": deny, "defaultMode": mode},
@@ -405,22 +475,80 @@ def normalize(relative: str) -> str:
 
 
 def is_allowed(tool: str, relative: str) -> tuple[bool, str]:
-    """Return (allowed, reason) for a tool ('Read', 'Edit', ...) on a path.
-
-    deny always wins over allow; unmatched paths fall back to defaultMode.
-    """
+    """Deny wins; broad relative allow/defaultMode never grant external access."""
     wanted = tool.upper()
-    target = normalize(relative)
+    try:
+        path = policy_path(relative)
+        real = path.resolve()
+        if not allowed_location(path):
+            return False, "path is outside rootDir and explicit external grants"
+        if wanted == "DELETE" and protected_root(path):
+            return False, "project and external grant roots cannot be deleted or moved"
+    except (OSError, RuntimeError, ValueError) as exc:
+        return False, f"invalid or inaccessible path: {exc}"
 
+    views = {rel(path), rel(real), path.as_posix(), real.as_posix()}
+    grants = []
+    for rule in PERMISSIONS.get("external", []):
+        level, lexical, canonical, entry = rule
+        if _is_within(real, canonical):
+            views.add(real.relative_to(canonical).as_posix() or ".")
+            # Also check the configured drive/UNC spelling, not just its canonical target.
+            views.add((lexical / real.relative_to(canonical)).as_posix())
+            grants.append(rule)
+    # A deny on a directory protects descendants too, including aliased secrets folders.
+    deny_views = set(views)
+    for view in views:
+        parts = view.split("/")
+        deny_views.update("/".join(parts[:i]) for i in range(1, len(parts)))
     for rule_tool, pattern, entry in PERMISSIONS["deny"]:
-        if rule_tool in (wanted, "*") and pattern.match(target):
+        if rule_tool in (wanted, "*", "WRITE") and any(pattern.match(view) for view in deny_views):
             return False, f"blocked by deny rule {entry}"
+
+    if not (_is_within(path, ROOT) and _is_within(real, ROOT)):
+        if not grants:
+            return False, "no explicit external grant matches the resolved directory"
+        # Most-specific directory wins. Write upgrades Read only on the same directory.
+        depth = max(len(rule[2].parts) for rule in grants)
+        selected = [rule for rule in grants if len(rule[2].parts) == depth]
+        writable = any(rule[0] == "WRITE" for rule in selected)
+        if wanted in {"LIST", "READ"} or (writable and wanted in {"EDIT", "CREATE", "DELETE"}):
+            return True, f"allowed by external grant {selected[0][3]}"
+        return False, "external directory is read-only; an explicit Write grant is required"
+
+    target = normalize(rel(real))
     for rule_tool, pattern, entry in PERMISSIONS["allow"]:
         if rule_tool in (wanted, "*") and pattern.match(target):
             return True, f"allowed by {entry}"
     if PERMISSIONS["default"] == "allow":
         return True, "allowed by defaultMode"
     return False, f"no allow rule matches {tool}({target})"
+
+
+def protected_root(path: Path) -> bool:
+    real = path.resolve()
+    return real == ROOT or any(real == rule[2] for rule in PERMISSIONS.get("external", []))
+
+
+def searchable_files(directory: Path, seen: set[Path] | None = None):
+    """Walk permitted aliases without following cycles or entering denied directories."""
+    seen = set() if seen is None else seen
+    try:
+        real = directory.resolve()
+        if real in seen or not is_allowed("Read", rel(directory))[0]:
+            return
+        seen.add(real)
+        entries = sorted(directory.iterdir(), key=lambda item: item.name.lower())
+    except (OSError, RuntimeError):
+        return
+    for item in entries:
+        if not is_allowed("Read", rel(item))[0]:
+            continue
+        if item.is_dir():
+            if item.name not in SKIP_DIRS and is_allowed("List", rel(item))[0]:
+                yield from searchable_files(item, seen)
+        elif item.is_file():
+            yield item
 
 
 def ensure_allowed(tool: str, path: Path) -> None:
@@ -532,6 +660,8 @@ def read_text(path: Path) -> tuple[str, bool]:
 
 
 def atomic_write(path: Path, content: str) -> None:
+    # Preserve a file symlink: replace its checked target, not the link itself.
+    path = path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
     try:
@@ -1271,7 +1401,7 @@ def list_files(path: str = ".", recursive: bool = False, max_depth: int = 3) -> 
     project_guide first: it carries the owner's rules for this project.
 
     Args:
-        path: Directory relative to the project root. Defaults to the root.
+        path: Relative project directory or explicitly granted external absolute directory. Defaults to the root.
         recursive: Include nested directories.
         max_depth: Maximum depth when recursive is True (1 = direct children).
     """
@@ -1285,17 +1415,22 @@ def list_files(path: str = ".", recursive: bool = False, max_depth: int = 3) -> 
     lines: list[str] = []
     hidden: list[str] = []
     truncated = False
+    seen: set[Path] = set()
 
     def walk(directory: Path, depth: int) -> None:
         nonlocal truncated
         if truncated:
             return
         try:
+            real = directory.resolve()
+            if real in seen:
+                return
+            seen.add(real)
             entries = sorted(
                 directory.iterdir(), key=lambda p: (p.is_file(), p.name.lower())
             )
-        except PermissionError:
-            lines.append(f"[SKIP] {rel(directory)}/ (permission denied)")
+        except (OSError, RuntimeError):
+            lines.append(f"[SKIP] {rel(directory)}/ (unreadable directory)")
             return
 
         for entry in entries:
@@ -1344,7 +1479,7 @@ def read_file(path: str, offset: int = 1, limit: int = 500) -> str:
     For large files read in pages: the footer reports the next offset to use.
 
     Args:
-        path: File path relative to the project root.
+        path: Relative project file or explicitly granted external absolute file.
         offset: 1-based line number to start from.
         limit: How many lines to return.
     """
@@ -1387,7 +1522,7 @@ def edit_file(path: str, old_string: str, new_string: str, replace_all: bool = F
     occurrence. Pass an empty new_string to delete the matched text.
 
     Args:
-        path: File path relative to the project root.
+        path: Relative project file or explicitly granted external absolute file.
         old_string: Exact text to find.
         new_string: Replacement text (empty string deletes).
         replace_all: Replace every occurrence instead of requiring uniqueness.
@@ -1491,11 +1626,15 @@ def delete(path: str, recursive: bool = False) -> str:
     """
     guard_write()
     target = resolve_path(path)
-    if target == ROOT:
-        raise ValueError("Refusing to delete the project root itself.")
+    if protected_root(target):
+        raise ValueError("Refusing to delete the project root or an external grant root itself.")
     ensure_allowed("Delete", target)
     if not target.exists():
         raise ValueError(f"Nothing to delete: {rel(target)}")
+
+    if target.is_symlink():
+        target.unlink()
+        return f"Deleted symlink {rel(target)}"
 
     if target.is_dir():
         inside = list(target.rglob("*"))
@@ -1535,7 +1674,7 @@ def search_text(
 
     Args:
         pattern: Text to look for (a regular expression when regex=True).
-        path: Directory or file to search, relative to the project root.
+        path: Relative project path or explicitly granted external absolute path.
         glob: File filter, e.g. "*.py" or "src/**/*.ts".
         regex: Treat pattern as a regular expression.
         case_sensitive: Match case exactly.
@@ -1563,13 +1702,9 @@ def search_text(
     if target.is_file():
         candidates.append(target)
     else:
-        for item in sorted(target.rglob("*")):
-            if len(candidates) > 5000:
+        for item in searchable_files(target):
+            if len(candidates) >= 5000:
                 break
-            if item.is_dir():
-                continue
-            if any(part in SKIP_DIRS for part in item.relative_to(ROOT).parts):
-                continue
             relative = rel(item)
             if not (name_filter.match(relative) or name_filter.match(item.name)):
                 continue
@@ -1677,7 +1812,7 @@ def multi_edit(path: str, edits: list[dict], regex: bool = False) -> str:
     succeed, so a failing edit leaves the file untouched.
 
     Args:
-        path: File path relative to the project root.
+        path: Relative project file or explicitly granted external absolute file.
         edits: List of replacement objects.
         regex: Treat old_string as a regular expression (new_string may use \\1).
     """
@@ -1758,16 +1893,16 @@ def move(source: str, destination: str, overwrite: bool = False) -> str:
     destination, so protected files cannot be moved out of their protection.
 
     Args:
-        source: Existing path relative to the project root.
-        destination: New path relative to the project root.
+        source: Existing relative project path or explicitly granted external absolute path.
+        destination: New relative project path or explicitly granted external absolute path.
         overwrite: Allow replacing an existing destination file.
     """
     guard_write()
     src = resolve_path(source)
     dst = resolve_path(destination)
 
-    if src == ROOT:
-        raise ValueError("Refusing to move the project root itself.")
+    if protected_root(src):
+        raise ValueError("Refusing to move the project root or an external grant root itself.")
     if not src.exists():
         raise ValueError(f"Source not found: {rel(src)}")
     if src == dst:
@@ -1783,7 +1918,8 @@ def move(source: str, destination: str, overwrite: bool = False) -> str:
         protected = [
             rel(item)
             for item in inside
-            if not is_allowed("Delete", rel(item))[0] or not is_allowed("Create", rel(item))[0]
+            if not is_allowed("Delete", rel(item))[0]
+            or not is_allowed("Create", rel(dst / item.relative_to(src)))[0]
         ]
         if protected:
             raise ValueError(
@@ -1796,6 +1932,7 @@ def move(source: str, destination: str, overwrite: bool = False) -> str:
             raise ValueError(f"{rel(dst)}/ already exists as a directory.")
         if not overwrite:
             raise ValueError(f"{rel(dst)} already exists. Pass overwrite=True to replace it.")
+        ensure_allowed("Delete", dst)
         dst.unlink()
 
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -1834,7 +1971,7 @@ def run_command(
 
     Args:
         command: Command line to execute.
-        cwd: Working directory relative to the project root.
+        cwd: Relative project directory or an external absolute directory granted Write.
         timeout: Seconds to wait (capped by maxCommandTimeout in config.json).
         background: Keep the process running after the call returns.
         wait_for: Regex; stop waiting once it appears in the output.
@@ -1856,6 +1993,8 @@ def run_command(
 
     work_dir = resolve_path(cwd)
     ensure_allowed("List", work_dir)
+    if not _is_within(work_dir.resolve(), ROOT):
+        ensure_allowed("Edit", work_dir)  # Read grants must not enable commands in an external cwd.
     if not work_dir.is_dir():
         raise ValueError(f"cwd is not a directory: {rel(work_dir)}")
 
