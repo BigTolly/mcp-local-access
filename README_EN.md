@@ -53,7 +53,7 @@ cloudflared tunnel  or  your own web server with TLS
 server.py  (listens on host:port, serves /mcp)
         │  every path is checked: sandbox + permissions
         ▼
-rootDir — the only folder that is accessible
+rootDir + explicitly granted external Read/Write directories
 ```
 
 Stack: Python + the MCP SDK for Python (FastMCP) + uvicorn, Streamable HTTP
@@ -131,7 +131,7 @@ cp config.example.json config.json
 
 | Key | Meaning |
 | --- | --- |
-| `rootDir` | The only folder the server has access to. Everything outside it is rejected. Required parameter. |
+| `rootDir` | Main file-sandbox directory. Everything outside it is denied except directories explicitly granted by absolute `Read`/`Write` rules. Required parameter. |
 | `host` | The interface to listen on. `0.0.0.0` by default — suitable both for a tunnel on this machine and for a proxy on another host. `127.0.0.1` — accept local connections only. |
 | `port` | The local port; the tunnel or proxy points here. 8000 by default. |
 | `readOnly` | `true` disables `edit_file`, `multi_edit`, `create`, `delete`, `move` and `run_command`. |
@@ -305,8 +305,9 @@ you can change it. The same JSON works with any client that accepts an
 
 ## 9. Tools
 
-All paths in the arguments are relative to `rootDir`. Absolute paths are
-rejected, as are symlinks leading outside the root.
+Project paths are relative to `rootDir`. Explicitly granted external directories
+can be accessed by absolute paths or project symlinks. Other external paths and
+links are blocked. See "External directories and network paths" in section 11.
 
 ### The guide
 
@@ -452,17 +453,17 @@ Claude Code style: `Tool(glob-path)`.
 }
 ```
 
-- The verbs: `List`, `Read`, `Edit`, `Create`, `Delete`, `Run` or `*` for all
+- The verbs: `List`, `Read`, `Edit`, `Create`, `Delete`, `Run`, external `Write` or `*` for all
   path verbs. How they map to the tools: `List` and `Read` together determine
   what `list_files` shows; `Read` also covers `search_text` and `file_info`;
   `Edit` covers `multi_edit`; `Create` — `create` and the destination of `move`; `Delete` —
   `delete` and the source of `move`.
 - `Run` stands apart: its argument is a command pattern, not a path, so
   `*(**)` never grants it. See "Rules for commands" below.
-- `defaultMode: "allow"` — everything that is not forbidden is allowed (a blacklist).
+- `defaultMode: "allow"` — inside `rootDir`, everything not forbidden is allowed (a blacklist). External directories always require an explicit absolute `Read`/`Write`.
 - `defaultMode: "deny"` — only the paths from `allow` work (a whitelist).
 - **`deny` is always stronger than `allow`.**
-- The patterns are defined relative to `rootDir`, the separator is `/`, and
+- Ordinary patterns are defined relative to `rootDir`, the separator is `/`, and
   `*` (one segment), `**` (any depth) and `?` (one character) are supported.
 - The patterns are anchored to the root, so `.env` matches **only** the file in
   the root. To cover all subfolders you need the `**/` prefix — `**/.env`.
@@ -476,6 +477,89 @@ Claude Code style: `Tool(glob-path)`.
 - `*(**/config.json)` closes access to the file for the model, so that it cannot rewrite
   its own permissions.
 
+
+### External directories and network paths
+
+To connect a specific directory outside `rootDir`, the owner adds an absolute
+`Read(directory)` or `Write(directory)` to `permissions.allow`. The project root
+stays unchanged. This grants the directory and its contents, not the entire drive.
+
+```json
+{
+  "permissions": {
+    "defaultMode": "allow",
+    "allow": [
+      "List(**)", "Read(**)", "Edit(**)", "Create(**)", "Delete(**)",
+      "Read(J:/src/**)",
+      "Write(//debian/share/work)"
+    ],
+    "deny": [
+      "*(**/.env)", "*(**/.env.*)", "*(**/config.json)",
+      "*(**/secrets/**)", "*(**/*.pem)", "*(**/*.key)",
+      "Delete(//debian/share/work/important/**)"
+    ]
+  }
+}
+```
+
+| External rule | Listing, search, metadata and reading | Editing and creation | Deletion and moves |
+| --- | --- | --- | --- |
+| `Read(J:/src)` | Yes | No | No |
+| `Write(J:/src)` | Yes | Yes | Yes, with source and destination permission checks |
+
+- `Read(J:/src)` and `Read(J:/src/**)` are equivalent: the directory itself and
+  all descendants are included. The same applies to `Write`. Other grant globs
+  are rejected; specify a concrete absolute directory.
+- Windows drive paths (`J:/src`, including spaces and Unicode), UNC paths
+  (`//debian/share/src`) and Linux/macOS absolute paths (`/mnt/share/src`) are
+  supported. Prefer `/`; a backslash must be escaped in JSON. On Linux, UNC does
+  not mount Samba automatically: mount the share through the OS and grant its
+  local mount path.
+- Relative `Read` rules retain their existing project meaning. `Write` in
+  `allow` requires an absolute external directory.
+- Broad relative `Edit(**)`, `*(**)` and `defaultMode: "allow"` neither grant
+  external access nor upgrade an external `Read` to `Write`.
+- Use `src/main.py` when `rootDir/src` links to the granted directory, or directly
+  use `J:/src/main.py` or `//debian/share/src/main.py`. Absolute paths inside
+  `rootDir` itself are still rejected; use relative project paths.
+- Final link targets are checked. An ungranted target, a sibling such as
+  `src-other`, incomplete UNC paths, `J:src`, device paths and Windows alternate
+  data streams are rejected. Listing and search skip denied directories and
+  avoid link cycles.
+- `deny` is checked against the alias, resolved target and path relative to the
+  granted directory. Rules such as `*(**/.env)` and `*(**/secrets/**)` apply
+  externally too; an innocent link name cannot reveal a forbidden target.
+  Denying a directory also protects its descendants. `Write(...)` in `deny`
+  blocks all file operations; use `Delete(...)` to forbid deletion alone.
+- With overlapping grants, the most-specific directory determines the level:
+  `Write(J:/src)` plus `Read(J:/src/vendor)` makes `vendor` read-only. On the same
+  directory, `Write` upgrades `Read`.
+- `readOnly: true` blocks all mutation tools even with `Write`. Neither `rootDir`
+  nor an external grant root may be deleted or moved. Editing through a file
+  symlink preserves the link; deleting an ordinary symlink deletes the link,
+  not its target.
+- OS/SMB permissions still apply: the server account must see the resource. UNC
+  is usually more reliable than a mapped drive tied to an interactive session.
+  The grant's resolved directory is pinned on startup; connect the share first.
+  After remapping a drive or changing the grant's link target, restart and review
+  the configuration.
+- `Read`/`Write` never grant `Run`. An external command `cwd` requires `Write`
+  plus a separate `Run` rule. However, a command started even inside the project
+  is not file-sandboxed and can access other paths.
+- These checks are not OS isolation. Concurrent local link changes and
+  Samba-side links permitted to leave the share need separate OS/SMB controls.
+
+Restart after changing code or rules. `config.example.json` grants no external
+folders by default; the owner adds actual paths to their own `config.json`.
+
+Run the regression tests without reading the live configuration or secrets:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Tests use temporary directories. UNC and mapped-drive routing are additionally
+simulated without connecting to a real Samba share.
 
 ### Rules for commands
 
@@ -548,7 +632,7 @@ Hardcoded in `server.py` (constants at the top of the file), changed by editing 
 ## 13. Security
 
 - Anyone who has the public URL **and** the token can read, change and delete
-  inside `rootDir` — everything that is not closed by the `deny` rules.
+  inside `rootDir` and explicitly granted external directories, subject to the granted operations and `deny` rules.
 - `run_command` is the widest hole: a child process is not bound by the path
   sandbox, so allowed `python *`, `node *` or `npm run *` can reach
   everything your user account can reach. Keep the `Run` list
@@ -581,13 +665,16 @@ Hardcoded in `server.py` (constants at the top of the file), changed by editing 
 | `Already running as #N` | The same command is still alive: inspect it, stop it or pass `restart=true` |
 | `Timed out after Ns` | A long-living command was started without `background=true` |
 | `command must be a single line` | Newlines separate commands; join the steps with `&&` |
-| `Absolute paths are not allowed` | That is by design: paths are relative to `rootDir` |
+| `Absolute paths inside rootDir are not allowed` | Use a relative project path |
+| `Path escapes the allowed root directory or external grants` | The target lacks an absolute `Read`/`Write` grant, or a link escaped its granted directory |
+| `external directory is read-only` | External mutations require explicit `Write`; internal `Edit(**)` is insufficient |
 
 ## 15. FAQ
 
 **What if I want several rootDirs?**
 
-One process — one root, that is the basis of the sandbox. The options:
+One process — one main root. For specific external directories, add absolute
+`Read`/`Write` grants as described in section 11. Other options:
 
 - Point to a common parent folder and narrow the access with permissions, for example
   `List(project-a/**)`, `Read(project-a/**)`, `Edit(project-a/**)` and the same for
@@ -619,10 +706,10 @@ connect directly to `http://127.0.0.1:8000/mcp` — in that case set
 
 **Can the model get outside rootDir?**
 
-With the file tools — no: absolute paths are rejected, `..` is resolved,
-symlinks pointing outside are discarded. Through `run_command` — yes: a child process is
-not restricted by the sandbox. If that is unacceptable, do not give any `Run` rules or
-enable `readOnly`.
+With file tools, not by default. The owner may explicitly grant specific external
+directories using absolute `Read`/`Write`; other external paths and links stay
+blocked. Through `run_command` — yes: a child process is not restricted by the
+sandbox. If that is unacceptable, do not give any `Run` rules or enable `readOnly`.
 
 **How do I forbid any changes at all?**
 
