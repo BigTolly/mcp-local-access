@@ -32,6 +32,7 @@ tested only on Windows; the macOS/Linux branches are written but not verified.
 7. [Connecting a client](#7-connecting-a-client)
 8. [JSON setup, using accio.com as an example](#8-json-setup-using-acciocom-as-an-example)
 9. [Tools](#9-tools)
+   - [Dialog box](#Dialog-box)
 10. [Rules.md — a short description of your project](#10-rulesmd--a-short-description-of-your-project)
 11. [Permissions](#11-permissions)
 12. [Limits](#12-limits)
