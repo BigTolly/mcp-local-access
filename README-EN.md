@@ -397,24 +397,46 @@ conversation, so usually there is no need to call it.
   can be inspected and stopped as usual — only the exact exit code is lost,
   because the server no longer owns its handle.
 
-### The action journal
+### Dialog box
 
-With `"audit": true` every command, move and `multi_edit` is appended to
-`logs/audit.log`:
+The `show-dialog-box()` tool opens an **Ask me** dialog box that lets you enter a continuous conversation loop with the agent.
 
+![Popup](./dialog-box.png)
+
+**Workflow**
+
+1. When using MCP Local Access, a rule is added to the agent's instructions: call `show-dialog-box` after completing a task or asking a clarifying question in chat.
+2. Enter your next request in the window and click **OK**. An empty response ends the dialog.
+3. If the user has not responded within 50 seconds (the timeout can be changed), the tool restarts itself; without this, the tool will time out.
+
+**Configuration**
+
+The `config.json` file contains parameters that configure this tool, for example:
+
+```json
+"dialog": {
+  "width": 500,
+  "height": 300,
+  "sound": true,
+  "autoPrompt": true,
+  "waitTimeoutSeconds": 50
+}
 ```
-2026-09-15 03:40:12 ok  run_command: #1 npm run dev (cwd .)
-2026-09-15 03:41:02 ok  move: src/old.ts -> src/new.ts
-```
+The settings specify the initial window width and height, the tool restart interval (change it deliberately), whether to play a sound when the tool is called, and whether to call the tool after an answer.
 
-This is the answer to the question "what did the model actually do" — useful after a long
-session or when something broke and the diff is not enough. Add `logs/` to
-`.gitignore`.
+**Automatic instruction to the agent**
 
-The journal is a sliding tail, not an archive: it is trimmed to the last 300 lines
-(`AUDIT_KEEP_LINES` in `server.py`) on start and every 100 entries, so it cannot grow
-indefinitely. Command logs are cleaned separately: on start every
-`logs/cmd-NNN.log` whose process is neither alive nor adopted is deleted.
+The instruction is sent in the MCP `instructions` field and also with the first
+tool result; it is sent again when the rules file changes or after
+a long pause.
+
+The parameter accepts only JSON `true`/`false`. If the parameter
+is absent, the instructions are enabled.
+
+**Waiting and timeouts**
+
+When a call's waiting period expires, the tool returns `Call show-dialog-box again to continue waiting for the same window.` The agent must call it again: it will resume waiting for **the same
+window**, without a duplicate or loss of the text already entered. If the response has already been submitted, the next call retrieves the saved result. A second concurrent waiting call receives a message that waiting is already in progress.
 
 ## 10. Rules.md — a short description of your project
 

@@ -9,6 +9,14 @@
   "audit": true,
   "maxCommandTimeout": 600,
 
+  "dialog": {
+    "width": 500,
+    "height": 300,
+    "sound": true,
+    "autoPrompt": true,
+    "waitTimeoutSeconds": 600
+  },
+
   "permissions": {
     "defaultMode": "allow",
     "allow": [

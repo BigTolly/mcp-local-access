@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import atexit
 import difflib
+import inspect
 import functools
 import json
 import os
@@ -1262,16 +1263,37 @@ Default for unmatched paths: {PERMISSIONS["default"]}
 """
 
 
+DIALOG_INSTRUCTION = (
+    "When using Local Access, always call show-dialog-box after completing a task "
+    "or asking the user a clarifying question in chat. "
+    "Stop on 'Dialog finished.', an explicit stop request, or an unavailable tool."
+)
+
+
+def dialog_instruction() -> str:
+    """Optional usage hint; no GUI import is needed during server startup."""
+    config = CONFIG.get("dialog", {})
+    if config is None:
+        config = {}
+    if not isinstance(config, dict):
+        raise ValueError("config.json: dialog must be an object")
+    enabled = config.get("autoPrompt", True)
+    if not isinstance(enabled, bool):
+        raise ValueError("dialog.autoPrompt must be true or false")
+    return DIALOG_INSTRUCTION if enabled else ""
+
+
 def build_instructions() -> str:
     """Usage notes plus the owner's project guide, delivered on connect."""
     rules, source = read_rules()
+    base = "\n".join(filter(None, (BASE_INSTRUCTIONS, dialog_instruction())))
     if not rules:
         return (
-            f"{BASE_INSTRUCTIONS}\nProject guide: {source}. Create {RULES_FILENAME} in the "
+            f"{base}\nProject guide: {source}. Create {RULES_FILENAME} in the "
             "project root to have it delivered here automatically.\n"
         )
     return (
-        f"{BASE_INSTRUCTIONS}\n"
+        f"{base}\n"
         f"===== Project guide from {source} - written by the owner, follow it =====\n\n"
         f"{rules}\n\n"
         f"===== end of {source} =====\n"
@@ -1370,7 +1392,7 @@ def guide_banner() -> str:
         return ""
     _guide_stamp = stamp
     _guide_sent = True
-    text = guide_text()
+    text = "\n\n".join(filter(None, (guide_text(), dialog_instruction())))
     return f"\n\n{text}" if text else ""
 
 
@@ -1385,8 +1407,8 @@ def project_guide() -> str:
     mark_guide_delivered()
     if not text:
         _, source = read_rules()
-        return f"No project guide: {source}."
-    return text
+        text = f"No project guide: {source}."
+    return "\n\n".join(filter(None, (text, dialog_instruction())))
 
 
 @mcp.tool()
@@ -2119,6 +2141,24 @@ def stop_process(id: int = 0, stop_all: bool = False) -> str:
     return f"Stopped #{record['id']} ({record['command']}). Log: {rel(record['log'])}"
 
 
+# ----------------------------------------------------------- desktop dialog ---
+
+
+@mcp.tool(name="show-dialog-box")
+async def show_dialog_box() -> str:
+    """Open a desktop input dialog on the machine running this MCP server.
+
+    Return the user's message; empty input or Escape ends the dialog.
+    The expand/collapse icon toggles a compact window and a full-height right-hand panel.
+    On timeout, call again to wait for the same window (no duplicate dialogs).
+    Requires an interactive desktop session and Python with Tkinter.
+    """
+    # import_module supports the hyphenated filename and caches one GUI session.
+    from importlib import import_module
+    dialog = import_module("dialog-box")
+    return await dialog.wait_for_dialog(CONFIG.get("dialog", {}))
+
+
 # --------------------------------------------------------- status banner ---
 
 
@@ -2136,12 +2176,19 @@ def attach_status_banner() -> None:
         return
 
     def wrap(inner):
-        @functools.wraps(inner)
-        def wrapper(*args, **kwargs):
-            result = inner(*args, **kwargs)
+        def append_banner(result):
             if isinstance(result, str):
                 return result + guide_banner() + status_banner()
             return result
+
+        if inspect.iscoroutinefunction(inner):
+            @functools.wraps(inner)
+            async def wrapper(*args, **kwargs):
+                return append_banner(await inner(*args, **kwargs))
+        else:
+            @functools.wraps(inner)
+            def wrapper(*args, **kwargs):
+                return append_banner(inner(*args, **kwargs))
 
         wrapper._banner_wrapped = True  # type: ignore[attr-defined]
         return wrapper
