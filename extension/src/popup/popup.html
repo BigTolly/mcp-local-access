@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Browser Control</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <img id="logo" src="../../icons/neutral-32.png" width="20" height="20" alt="">
+    <h1>Browser Control</h1>
+    <span id="version" class="muted"></span>
+  </header>
+
+  <section class="rows">
+    <div class="row"><span class="label">Server</span><span id="server" class="value"><span class="dot"></span><span class="text">…</span></span></div>
+    <div class="row"><span class="label">Tab</span><span id="tab" class="value">…</span></div>
+    <div class="row"><span class="label">Debugger</span><span id="debugger" class="value">…</span></div>
+  </section>
+
+  <p id="error" class="error" hidden></p>
+
+  <div class="actions">
+    <button id="connect" class="primary">Connect this tab</button>
+    <button id="disconnect" class="secondary" hidden>Disconnect</button>
+  </div>
+
+  <details>
+    <summary>Settings &amp; diagnostics</summary>
+    <form id="portForm" class="port">
+      <label for="port">Local Access port</label>
+      <input id="port" type="number" min="1" max="65535" required>
+      <button type="submit" class="secondary">Save</button>
+    </form>
+    <label class="check" title="Chrome reports Cancel and the close cross on its debugging bar as the same event. Off: only the debugger pauses, the tab stays connected and re-attaches on the next command. On: the tab is disconnected.">
+      <input id="barCancel" type="checkbox">
+      <span>Cancel / ✕ on Chrome's debugging bar disconnects the tab</span>
+    </label>
+    <label class="check" title="Off (default): browser_navigate and browser_cdp refuse file:// pages. With Chrome's 'Allow access to file URLs' on, file:// lets the AI read any file of this computer, outside the Local Access folder and its rules.">
+      <input id="allowFile" type="checkbox">
+      <span>Allow file:// pages (the AI can read any local file)</span>
+    </label>
+    <button id="diag" class="secondary wide">Run diagnostics</button>
+    <pre id="diagOut" hidden></pre>
+  </details>
+
+  <script src="popup.js"></script>
+</body>
+</html>

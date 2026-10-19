@@ -6,7 +6,17 @@ File tools    : list_files, read_file, search_text, file_info,
                 edit_file, multi_edit, create, move, delete
 Command tools : run_command, list_processes, check_process, stop_process
 Guide tool    : project_guide (Rules.md, also pushed with the first result)
+Browser tools : browser_navigate, browser_snapshot, browser_click, browser_type,
+                browser_hover, browser_drag, browser_select_option,
+                browser_press_key, browser_go_back, browser_go_forward,
+                browser_wait, browser_screenshot, browser_get_console_logs,
+                browser_status, browser_diagnostics, browser_console,
+                browser_network, browser_capture, browser_cdp, browser_evaluate,
+                browser_launch, browser_close,
+                browser_cdp_events (Browser Control extension in extension/;
+                the old Browser MCP extension covers the first 14, no npx needed)
 Transport: Streamable HTTP at /mcp
+Usage: python server.py [--config other.json]   (file is looked up next to server.py)
 Auth: Authorization: Bearer <MCP_TOKEN>
 File sandbox: ROOT_DIR plus explicitly granted external Read/Write directories.
 Shell commands are not filesystem-sandboxed.
@@ -21,7 +31,10 @@ Path validation and edit logic are modelled on the MIT-licensed
 
 from __future__ import annotations
 
+import argparse
+import asyncio
 import atexit
+import base64
 import difflib
 import inspect
 import functools
@@ -47,7 +60,7 @@ except ImportError:  # pragma: no cover
 
 try:
     import uvicorn
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server.fastmcp import FastMCP, Image
 except ImportError:  # pragma: no cover
     print("Missing dependencies. Run: pip install -r requirements.txt")
     raise SystemExit(1)
@@ -59,7 +72,7 @@ BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
 load_dotenv(ENV_PATH)
 
-CONFIG_PATH = Path(os.getenv("CONFIG_FILE") or (BASE_DIR / "config.json"))
+DEFAULT_CONFIG_NAME = "config.json"
 
 MAX_RESPONSE_CHARS = 100_000
 MAX_CONTENT_BYTES = 1024 * 1024  # 1 MB
@@ -145,8 +158,35 @@ def ensure_token() -> str:
     return token
 
 
+def resolve_config_path() -> Path:
+    """Pick the settings file: --config, then CONFIG_FILE, then config.json.
+
+    "python server.py --config new.json" looks the file up in the folder of
+    server.py, so start.cmd never needs a full path. A file named explicitly
+    with --config must exist; only the default config.json may be missing.
+    """
+    parser = argparse.ArgumentParser(description="MCP Local Access")
+    parser.add_argument(
+        "--config",
+        "-c",
+        metavar="FILE",
+        help=f"settings file next to server.py (default: {DEFAULT_CONFIG_NAME})",
+    )
+    args, _ = parser.parse_known_args()
+    name = (args.config or "").strip().strip('"')
+    if name:
+        path = BASE_DIR / name
+        if not path.is_file():
+            fail(f"Config file not found: {path}. Put it next to server.py or drop --config.")
+        return path
+    return Path(os.getenv("CONFIG_FILE") or (BASE_DIR / DEFAULT_CONFIG_NAME))
+
+
+CONFIG_PATH = resolve_config_path()
+
+
 def load_config_file() -> dict:
-    """Read config.json. Missing file is fine; broken JSON is fatal."""
+    """Read the active config. Missing default file is fine; broken JSON is fatal."""
     if not CONFIG_PATH.exists():
         return {}
     try:
@@ -195,6 +235,62 @@ AUDIT_PATH = LOG_DIR / AUDIT_FILENAME
 STATE_PATH = LOG_DIR / STATE_FILENAME
 AUDIT = bool(CONFIG.get("audit", True))
 COMMAND_TIMEOUT_CAP = max(1, int(CONFIG.get("maxCommandTimeout") or MAX_TIMEOUT))
+
+# The active config is always protected, whatever its name: a deny rule such as
+# *(**/config.json) would not cover a file started with --config new.json.
+ACTIVE_CONFIG = CONFIG_PATH.resolve()
+
+# --- browser (Browser MCP extension bridge) --------------------------------
+BROWSER_DEFAULT_PORT = 9009     # the port the extension connects to
+BROWSER_DEFAULT_TIMEOUT = 30    # seconds to wait for the extension to answer
+BROWSER_MAX_MESSAGE = 64 * 1024 * 1024  # screenshots travel as base64 text
+BROWSER_MAX_WAIT = 60           # ceiling for browser_wait
+BROWSER_LAUNCH_TIMEOUT = 30     # browser_launch: wait for the extension to connect
+BROWSER_CLOSE_TIMEOUT = 10      # browser_close: wait for Chrome to exit by itself
+# Hides Chrome's "started debugging this browser" bar. Chrome keeps one
+# process per profile and reads flags only when that process starts, so the
+# owner's own shortcut needs the flag too (README, browser_launch).
+BROWSER_SILENT_FLAG = "--silent-debugger-extension-api"
+
+
+def browser_settings() -> dict:
+    spec = CONFIG.get("browser", {})
+    if spec is None:
+        spec = {}
+    if not isinstance(spec, dict):
+        fail(f'{CONFIG_PATH.name}: "browser" must be a JSON object.')
+    try:
+        port = int(spec.get("port") or BROWSER_DEFAULT_PORT)
+        timeout = max(1, int(spec.get("timeoutSeconds") or BROWSER_DEFAULT_TIMEOUT))
+        launch_timeout = max(5, int(spec.get("launchTimeoutSeconds") or BROWSER_LAUNCH_TIMEOUT))
+        close_timeout = max(1, int(spec.get("closeTimeoutSeconds") or BROWSER_CLOSE_TIMEOUT))
+    except (TypeError, ValueError):
+        fail(f"{CONFIG_PATH.name}: browser.port and browser.*Seconds must be numbers.")
+    launch_args = spec.get("launchArgs") or []
+    if not isinstance(launch_args, list) or not all(isinstance(arg, str) for arg in launch_args):
+        fail(f'{CONFIG_PATH.name}: "browser.launchArgs" must be a list of strings.')
+    return {
+        "enabled": bool(spec.get("enabled", True)),
+        "host": str(spec.get("host") or "localhost").strip(),
+        "port": port,
+        "timeout": timeout,
+        # file:// pages show the AI any file of this computer, past rootDir and
+        # its deny rules, so browser_navigate / browser_cdp refuse them unless
+        # the owner opts in here (and in the Browser Control popup).
+        "allowFileUrls": bool(spec.get("allowFileUrls", False)),
+        # browser_launch: Chrome binary (auto-detected when empty), optional
+        # profile overrides and extra flags. Empty userDataDir = the owner's
+        # normal profile, so signed-in sites stay signed in.
+        "chromePath": str(spec.get("chromePath") or "").strip(),
+        "userDataDir": str(spec.get("userDataDir") or "").strip(),
+        "profileDirectory": str(spec.get("profileDirectory") or "").strip(),
+        "launchArgs": list(launch_args),
+        "launchTimeout": launch_timeout,
+        "closeTimeout": close_timeout,
+    }
+
+
+BROWSER = browser_settings()
 
 
 # ------------------------------------------------------------- sandboxing ---
@@ -483,6 +579,8 @@ def is_allowed(tool: str, relative: str) -> tuple[bool, str]:
         real = path.resolve()
         if not allowed_location(path):
             return False, "path is outside rootDir and explicit external grants"
+        if real == ACTIVE_CONFIG:
+            return False, "the active config file is protected"
         if wanted == "DELETE" and protected_root(path):
             return False, "project and external grant roots cannot be deleted or moved"
     except (OSError, RuntimeError, ValueError) as exc:
@@ -1255,7 +1353,16 @@ check_process / stop_process to follow up instead of launching a duplicate.
 Some paths are blocked by the owner's permission rules. A "Permission denied"
 result is final: do not retry it and do not look for a way around it.
 
+browser_* tools drive the owner's own browser through the Browser MCP extension.
+Call browser_snapshot first and pass the element refs it returns to
+browser_click / browser_type / browser_hover. If no tab is connected, call
+browser_launch (it opens Chrome with the owner's profile and connects its tab
+by itself) or ask the user to press "Connect" in the extension; do not retry in
+a loop. After work started with browser_launch, call browser_close.
+
 Root directory: {ROOT}
+Config file: {CONFIG_PATH.name}
+Browser tools: {"on" if BROWSER["enabled"] else "off"}
 Read-only mode: {"on" if READ_ONLY else "off"}
 Blocked rules: {", ".join(PERMISSIONS["raw"]["deny"]) or "nothing"}
 Allowed commands: {", ".join(entry for _, entry in PERMISSIONS["allowRun"]) or "none"}
@@ -2159,6 +2266,971 @@ async def show_dialog_box() -> str:
     return await dialog.wait_for_dialog(CONFIG.get("dialog", {}))
 
 
+# ---------------------------------------------------------------- browser ---
+
+# Replaces "npx @browsermcp/mcp": the Browser MCP extension connects to
+# ws://localhost:9009 once "Connect" is pressed on a tab, and this server plays
+# the part of that npx process. Wire format, taken from @browsermcp/mcp:
+#   request : {"id": "<uuid>", "type": "browser_click", "payload": {...}}
+#   response: {"type": "messageResponse",
+#              "payload": {"requestId": "<uuid>", "result": ... | "error": "..."}}
+# The extension only talks to a local port, which is why a stdio MCP cannot be
+# used by cloud agents, while this HTTP server can relay for them.
+
+BROWSER_NO_TAB = (
+    "No connection to the browser extension. Open the tab to automate, click the "
+    "Browser Control (or Browser MCP) extension icon in the browser toolbar and press "
+    "'Connect', then retry. Or call browser_launch to open a Chrome window for the agent "
+    "that connects by itself (Browser Control 1.1.0+)."
+)
+BROWSER_EXTENSION_NO_TAB = "No tab is connected"
+
+# browser_launch opens http://<host>:<port>/bc-launch#<token>. The token sits
+# in the fragment, so it never reaches this server in an HTTP request or a log;
+# Browser Control reads it from the tab URL and sends it back on the WebSocket
+# (?launch=<token>). While an agent session holds the bridge, connections
+# without the token are refused, so another browser window or profile with the
+# extension cannot take the bridge over ("new connection replaces the old one").
+LAUNCH_PAGE_PATH = "/bc-launch"
+CLOSE_BAD_TOKEN = 4403   # unknown or expired launch token
+CLOSE_AGENT_BUSY = 4409  # an agent session owns the bridge
+LAUNCH_PAGE_HTML = (
+    "<!doctype html><meta charset=utf-8><title>Browser Control: agent session</title>"
+    "<body style=\"font:15px system-ui;margin:3em;color:#444\">"
+    "<h3>Local Access: connecting the agent's tab...</h3>"
+    "<p>Browser Control picks this tab up by itself; no Connect click is needed. "
+    "If nothing happens, check that the extension (1.1.0+) is installed and enabled.</p>"
+)
+
+
+def describe_listen_error(exc: BaseException, port: int) -> str:
+    if isinstance(exc, ImportError):
+        return "the websockets package is missing; run: pip install -r requirements.txt"
+    if isinstance(exc, OSError) and exc.errno in {48, 98, 10048}:
+        return (
+            f"port {port} is busy - most likely another Browser MCP server "
+            "(npx @browsermcp/mcp, e.g. started by Claude Code) is running. Close it and retry."
+        )
+    return f"cannot listen on port {port}: {exc}"
+
+
+class BrowserBridge:
+    """WebSocket server for the extension on a private event-loop thread.
+
+    uvicorn owns the main loop; a separate loop keeps the bridge independent
+    of it, and tool calls hop over with run_coroutine_threadsafe. A new
+    extension connection replaces the old one, as in @browsermcp/mcp.
+    """
+
+    def __init__(self, host: str, port: int) -> None:
+        self.host = host
+        self.port = port
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.server = None
+        self.ws = None
+        self.connected_at = 0.0
+        self.pending: dict[str, tuple[asyncio.Future, object]] = {}
+        self.error = ""
+        self.lock = threading.Lock()
+        # Agent browser session (browser_launch): token, process, mode, ...
+        self.launch: dict | None = None
+        self.ws_launch = False  # the current connection carries the launch token
+
+    # -- lifecycle, called from any thread ---------------------------------
+
+    def start(self) -> bool:
+        """Listen on the port once; a failed attempt is retried on the next call."""
+        with self.lock:
+            if self.server is not None:
+                return True
+            if self.loop is None:
+                self.loop = asyncio.new_event_loop()
+                threading.Thread(
+                    target=self.loop.run_forever, name="browser-bridge", daemon=True
+                ).start()
+            future = asyncio.run_coroutine_threadsafe(self._listen(), self.loop)
+            try:
+                future.result(timeout=15)
+            except BaseException as exc:  # noqa: BLE001 - reported to the model
+                self.error = describe_listen_error(exc, self.port)
+                return False
+            self.error = ""
+            return True
+
+    def connected(self) -> bool:
+        return self.ws is not None
+
+    async def call(self, kind: str, payload=None, timeout: int | None = None):
+        """Send one request to the extension and return its result."""
+        if not BROWSER["enabled"]:
+            raise ValueError(f'Browser tools are disabled ("browser.enabled": false in {CONFIG_PATH.name}).')
+        if not self.start():
+            raise ValueError(f"Browser bridge is not running: {self.error}")
+        request = self._request(kind, payload, timeout or BROWSER["timeout"])
+        try:
+            return await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(request, self.loop))
+        except RuntimeError as exc:
+            message = str(exc)
+            if message == BROWSER_EXTENSION_NO_TAB:
+                message = BROWSER_NO_TAB
+            raise ValueError(message) from None
+
+    # -- bridge loop --------------------------------------------------------
+
+    async def _listen(self) -> None:
+        extra = {}
+        try:
+            from websockets.asyncio.server import serve  # websockets >= 13
+            extra["process_request"] = self._process_request
+        except ImportError:
+            from websockets import serve  # older releases: no launch page, the tab shows an HTTP error but still connects
+        self.server = await serve(
+            self._handle,
+            self.host,
+            self.port,
+            max_size=BROWSER_MAX_MESSAGE,
+            ping_interval=20,
+            ping_timeout=20,
+            **extra,
+        )
+
+    @staticmethod
+    def _process_request(connection, request):
+        """Serve the small browser_launch page; everything else is a WebSocket handshake."""
+        path = str(getattr(request, "path", "") or "").split("?", 1)[0].rstrip("/")
+        if path != LAUNCH_PAGE_PATH:
+            return None
+        from http import HTTPStatus
+        response = connection.respond(HTTPStatus.OK, LAUNCH_PAGE_HTML)
+        del response.headers["Content-Type"]
+        response.headers["Content-Type"] = "text/html; charset=utf-8"
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @staticmethod
+    def _launch_params(ws, rest) -> tuple[str, bool]:
+        """(token, probe) from the connection path ?launch=<token>[&probe=1]."""
+        request = getattr(ws, "request", None)
+        path = getattr(request, "path", None) or getattr(ws, "path", None)
+        if not path and rest and isinstance(rest[0], str):
+            path = rest[0]
+        query = str(path or "").partition("?")[2]
+        from urllib.parse import parse_qs
+        params = parse_qs(query)
+        token = (params.get("launch") or [""])[0]
+        return token, (params.get("probe") or [""])[0] == "1"
+
+    def launch_alive(self) -> bool:
+        """An agent session still holds the bridge (not released, its Chrome not gone)."""
+        launch = self.launch
+        if not launch or launch.get("released"):
+            return False
+        process = launch.get("process")
+        if launch.get("mode") == "own" and process is not None and process.poll() is not None:
+            return False
+        return True
+
+    def launch_connected(self) -> bool:
+        return self.ws is not None and self.ws_launch and self.launch is not None
+
+    def _admit(self, token: str) -> tuple[int, str] | None:
+        """None to accept the connection, or the (code, reason) to close it with."""
+        launch = self.launch
+        if token:
+            if launch and secrets.compare_digest(token, str(launch.get("token") or "")):
+                return None
+            return CLOSE_BAD_TOKEN, "unknown or expired launch token"
+        if self.launch_alive():
+            return CLOSE_AGENT_BUSY, "an agent browser session (browser_launch) owns the bridge"
+        return None
+
+    async def _handle(self, ws, *rest) -> None:
+        token, probe = self._launch_params(ws, rest)
+        refusal = self._admit(token)
+        if probe:
+            # Browser Control checks a launch token before switching tabs; a
+            # probe never replaces the current connection.
+            try:
+                if refusal is None and token:
+                    await ws.send(json.dumps({"type": "launchAccepted"}))
+                    await ws.close(1000, "probe done")
+                else:
+                    await ws.close(CLOSE_BAD_TOKEN, "unknown or expired launch token")
+            except Exception:
+                pass
+            return
+        if refusal is not None:
+            try:
+                await ws.close(*refusal)
+            except Exception:
+                pass
+            return
+        previous, self.ws = self.ws, ws
+        self.ws_launch = bool(token)
+        self.connected_at = time.time()
+        if token and self.launch is not None:
+            self.launch["connected"] = True
+            self.launch["released"] = False
+        audit("browser", "extension connected" + (" (agent session)" if token else ""))
+        if previous is not None:
+            try:
+                await previous.close()
+            except Exception:
+                pass
+        try:
+            async for raw in ws:
+                self._dispatch(raw)
+        except Exception:
+            pass
+        finally:
+            if self.ws is ws:
+                self.ws = None
+                self.ws_launch = False
+                audit("browser", "extension disconnected")
+            # A clean close (Disconnect, the agent's tab closed) ends the lock:
+            # manual Connect works again. A dropped link (service-worker
+            # restart) keeps it, the extension comes back with the token.
+            # Only when no newer connection took over, and only for the
+            # current session's token (not one left over from an older launch).
+            launch = self.launch
+            if (token and launch is not None and self.ws is None
+                    and getattr(ws, "close_code", None) == 1000
+                    and secrets.compare_digest(token, str(launch.get("token") or ""))):
+                launch["released"] = True
+            for request_id, (future, owner) in list(self.pending.items()):
+                if owner is ws and not future.done():
+                    future.set_exception(RuntimeError(BROWSER_NO_TAB))
+                    self.pending.pop(request_id, None)
+
+    def _dispatch(self, raw) -> None:
+        try:
+            message = json.loads(raw)
+        except (TypeError, ValueError):
+            return
+        if not isinstance(message, dict) or message.get("type") != "messageResponse":
+            return
+        payload = message.get("payload") or {}
+        entry = self.pending.pop(str(payload.get("requestId")), None)
+        if entry is None or entry[0].done():
+            return
+        if payload.get("error"):
+            entry[0].set_exception(RuntimeError(str(payload["error"])))
+        else:
+            entry[0].set_result(payload.get("result"))
+
+    async def _request(self, kind: str, payload, timeout: int):
+        ws = self.ws
+        if ws is None:
+            raise RuntimeError(BROWSER_NO_TAB)
+        request_id = secrets.token_hex(16)
+        message: dict = {"id": request_id, "type": kind}
+        if payload is not None:  # getUrl / getTitle are sent without a payload
+            message["payload"] = payload
+        future = asyncio.get_running_loop().create_future()
+        self.pending[request_id] = (future, ws)
+        try:
+            try:
+                await ws.send(json.dumps(message))
+            except Exception:
+                raise RuntimeError(BROWSER_NO_TAB) from None
+            return await asyncio.wait_for(future, timeout)
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"The browser extension did not answer {kind} within {timeout}s."
+            ) from None
+        finally:
+            self.pending.pop(request_id, None)
+
+
+BRIDGE = BrowserBridge(BROWSER["host"], BROWSER["port"])
+
+
+def navigation_refusal(url) -> str:
+    """Why the server refuses to open a URL in the tab, or "".
+
+    Mirrors Browser Control 1.0.3, so an older extension (or Browser MCP)
+    cannot be used to step outside the sandbox through the browser.
+    """
+    value = str(url or "").strip().lower()
+    if value.startswith("javascript:"):
+        return "javascript: URLs replace the page with their result; use browser_evaluate to run code in the page."
+    if value.startswith("file:") and not BROWSER["allowFileUrls"]:
+        return (
+            "file:// pages would show the AI any file of this computer, outside rootDir and "
+            f'its deny rules. The owner can allow them with "browser.allowFileUrls": true in {CONFIG_PATH.name}.'
+        )
+    return ""
+
+
+def guard_browser_action() -> None:
+    if READ_ONLY:
+        raise ValueError(
+            "Server is running in READ_ONLY mode; browser actions and diagnostic "
+            "start/stop/clear operations are disabled. Reading diagnostics is allowed."
+        )
+
+
+async def page_snapshot(status: str = "") -> str:
+    """URL, title and the ARIA snapshot with element refs, as @browsermcp/mcp does."""
+    url = await BRIDGE.call("getUrl")
+    title = await BRIDGE.call("getTitle")
+    snapshot = await BRIDGE.call("browser_snapshot", {})
+    head = f"{status}\n" if status else ""
+    return clamp(
+        f"{head}\n- Page URL: {url}\n- Page Title: {title}\n- Page Snapshot\n"
+        f"```yaml\n{snapshot}\n```\n"
+    )
+
+
+@mcp.tool()
+async def browser_status() -> str:
+    """Show whether the browser extension (Browser Control or Browser MCP) is connected, with tab/debugger health."""
+    if not BROWSER["enabled"]:
+        return f'Browser tools are disabled ("browser.enabled": false in {CONFIG_PATH.name}).'
+    if not BRIDGE.start():
+        return f"Browser bridge is not running: {BRIDGE.error}"
+    where = f"ws://{BROWSER['host']}:{BROWSER['port']}"
+    agent = launch_summary(BRIDGE.launch)
+    if not BRIDGE.connected():
+        return f"Listening on {where}; no tab connected; {agent}. {BROWSER_NO_TAB}"
+    age = int(time.time() - BRIDGE.connected_at)
+    try:
+        diagnostic = await BRIDGE.call("browser_diagnostics", {}, timeout=5)
+    except Exception as exc:
+        return (f"Listening on {where}; WebSocket connected ({age}s ago); {agent}, "
+                f"but tab/debugger diagnostics are unavailable: {exc}")
+    return (f"Listening on {where}; WebSocket connected ({age}s ago); {agent}.\n"
+            + json.dumps(diagnostic, ensure_ascii=False))
+
+
+# ------------------------------------------------- agent browser session ---
+
+
+def find_chrome() -> str:
+    """Chrome binary for browser_launch: browser.chromePath, else the usual places."""
+    configured = BROWSER["chromePath"]
+    if configured:
+        if Path(configured).is_file():
+            return configured
+        raise ValueError(f'"browser.chromePath" in {CONFIG_PATH.name} does not point to a file: {configured}')
+    candidates: list[str] = []
+    if IS_WINDOWS:
+        try:
+            import winreg
+            for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                try:
+                    with winreg.OpenKey(hive, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe") as key:
+                        candidates.append(str(winreg.QueryValue(key, None)))
+                except OSError:
+                    pass
+        except ImportError:
+            pass
+        for env in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
+            base = os.environ.get(env)
+            if base:
+                candidates.append(str(Path(base) / "Google" / "Chrome" / "Application" / "chrome.exe"))
+    elif sys.platform == "darwin":
+        app = "Google Chrome.app/Contents/MacOS/Google Chrome"
+        candidates += [f"/Applications/{app}", str(Path.home() / "Applications" / app)]
+    else:
+        for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
+            found = shutil.which(name)
+            if found:
+                candidates.append(found)
+    for candidate in candidates:
+        if candidate and Path(candidate.strip('"')).is_file():
+            return candidate.strip('"')
+    raise ValueError(
+        f'Chrome was not found. Set "browser.chromePath" in {CONFIG_PATH.name} to the chrome executable.'
+    )
+
+
+def end_process_tree(process: subprocess.Popen, force: bool) -> None:
+    """Ask (force=False) or make (force=True) the Chrome that browser_launch started exit.
+
+    Only ever the Popen this server created: its handle pins the PID, so a
+    reused PID of someone else's process cannot be hit.
+    """
+    if process.poll() is not None:
+        return
+    if IS_WINDOWS:
+        # Without /F taskkill sends WM_CLOSE: Chrome shuts down cleanly and
+        # keeps the session for "Continue where you left off".
+        command = ["taskkill", "/PID", str(process.pid), "/T"] + (["/F"] if force else [])
+        subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=15, check=False)
+        return
+    sig = signal.SIGKILL if force else signal.SIGTERM
+    try:
+        os.killpg(process.pid, sig)  # start_new_session: the group is Chrome's own
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            process.kill() if force else process.terminate()
+        except OSError:
+            pass
+
+
+async def wait_process_exit(process: subprocess.Popen, seconds: float) -> bool:
+    deadline = time.monotonic() + max(0.0, seconds)
+    while process.poll() is None:
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(0.25)
+    return True
+
+
+def launch_summary(launch: dict | None) -> str:
+    if not launch:
+        return "no agent browser session"
+    process = launch.get("process")
+    alive = process is not None and process.poll() is None
+    mode = {
+        "own": f"Chrome started by the agent (PID {launch.get('pid')}, {'running' if alive else 'exited'})",
+        "shared": "a window in the owner's already running Chrome",
+    }.get(str(launch.get("mode")), "starting")
+    state = "connected" if BRIDGE.launch_connected() else ("released" if launch.get("released") else "not connected")
+    return f"agent browser session: {mode}; tab {state}"
+
+
+@mcp.tool()
+async def browser_launch(url: str = "") -> str:
+    """Open Chrome for the agent and connect Browser Control to its tab, no Connect click needed.
+
+    Uses the owner's normal Chrome profile, so sites the owner is signed in to
+    stay signed in. Chrome is started with --silent-debugger-extension-api.
+    - Chrome not running yet: the agent owns that Chrome; browser_close ends it by PID.
+    - Chrome already running: a new tab opens in the owner's last active window
+      (Chrome makes it the active tab); the flag only works if the owner started
+      Chrome with it too, and browser_close closes only the agent's tab, never
+      the owner's browser.
+    The tab keeps working when the window is minimized or another tab is active.
+    The extension must already be installed by the owner; nothing is installed here.
+    url: page to open once connected (optional). Returns the page snapshot.
+    """
+    guard_browser_action()
+    if not BROWSER["enabled"]:
+        raise ValueError(f'Browser tools are disabled ("browser.enabled": false in {CONFIG_PATH.name}).')
+    url = str(url or "").strip()
+    refusal = navigation_refusal(url) if url else ""
+    if refusal:
+        raise ValueError(refusal)
+    if not BRIDGE.start():
+        raise ValueError(f"Browser bridge is not running: {BRIDGE.error}")
+
+    previous = BRIDGE.launch
+    if previous and BRIDGE.launch_connected():
+        if url:
+            await BRIDGE.call("browser_navigate", {"url": url})
+            audit("browser_navigate", url)
+        return await page_snapshot("The agent browser session is already open; reused its tab.")
+    # An agent Chrome from an earlier launch that is still running stays ours:
+    # the new start is handed over to it, so browser_close may still end it.
+    kept = None
+    if previous and previous.get("mode") == "own":
+        process = previous.get("process")
+        if process is not None and process.poll() is None:
+            kept = process
+
+    chrome = find_chrome()
+    token = secrets.token_urlsafe(24)
+    page_host = BROWSER["host"] if BROWSER["host"] not in ("", "0.0.0.0", "::") else "127.0.0.1"
+    launch_url = f"http://{page_host}:{BROWSER['port']}{LAUNCH_PAGE_PATH}#{token}"
+    args = [chrome, BROWSER_SILENT_FLAG]
+    if BROWSER["userDataDir"]:
+        args.append(f"--user-data-dir={BROWSER['userDataDir']}")
+    if BROWSER["profileDirectory"]:
+        args.append(f"--profile-directory={BROWSER['profileDirectory']}")
+    # No --new-window: in a running Chrome the page opens as a new tab of the
+    # last active window, the way the owner asked for.
+    args += BROWSER["launchArgs"] + [launch_url]
+
+    options: dict = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
+                     "stderr": subprocess.DEVNULL, "close_fds": True}
+    if IS_WINDOWS:
+        # Detached: Chrome outlives the server and ignores its console's Ctrl+C.
+        options["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        options["start_new_session"] = True
+    launch = {"token": token, "process": None, "pid": None, "mode": "starting",
+              "started": time.time(), "connected": False, "released": False}
+    BRIDGE.launch = launch  # set before the start, so the connection is admitted
+    try:
+        process = subprocess.Popen(args, **options)
+    except OSError as exc:
+        BRIDGE.launch = None
+        raise ValueError(f"Cannot start Chrome ({chrome}): {exc}") from None
+    launch["process"], launch["pid"] = process, process.pid
+
+    deadline = time.monotonic() + BROWSER["launchTimeout"]
+    while not launch["connected"]:
+        if time.monotonic() >= deadline:
+            launch["mode"] = "own" if process.poll() is None else "shared"
+            if kept is not None and launch["mode"] == "shared":
+                launch.update(mode="own", process=kept, pid=kept.pid)
+            launch["released"] = True  # do not keep manual Connect locked out
+            audit("browser_launch", f"no connection in {BROWSER['launchTimeout']}s", ok=False)
+            raise ValueError(
+                f"Chrome was started, but Browser Control did not connect within "
+                f"{BROWSER['launchTimeout']}s. Check that the extension (1.1.0 or newer) is "
+                f"installed and enabled in this Chrome profile and uses port {BROWSER['port']}. "
+                "browser_close can end what was started."
+            )
+        await asyncio.sleep(0.2)
+
+    # A start handed over to an already running Chrome exits at once; a Chrome
+    # that was not running keeps this process as its browser process.
+    if process.poll() is None:
+        launch["mode"] = "own"
+    elif kept is not None:
+        launch.update(mode="own", process=kept, pid=kept.pid)
+    else:
+        launch["mode"] = "shared"
+    audit("browser_launch", f"{launch['mode']} pid {launch['pid']}")
+    if launch["mode"] == "own":
+        status = (f"Chrome started for the agent (PID {launch['pid']}), tab connected. "
+                  "Call browser_close when done.")
+    else:
+        status = ("Chrome was already running: opened a new tab in the owner's browser and "
+                  "connected it. The debugging bar is hidden only if that Chrome was started "
+                  f"with {BROWSER_SILENT_FLAG}. browser_close closes only this tab.")
+    if url:
+        await BRIDGE.call("browser_navigate", {"url": url})
+        audit("browser_navigate", url)
+    return await page_snapshot(status)
+
+
+@mcp.tool()
+async def browser_close(force: bool = False) -> str:
+    """Close the agent's tab opened by browser_launch; end Chrome by PID if the agent started it.
+
+    Never touches a Chrome the owner had running before browser_launch: there
+    only the agent's tab is closed. When the agent started Chrome and other
+    tabs are open in it (the owner may be using them), Chrome is left running
+    unless force=True.
+    """
+    guard_browser_action()
+    launch = BRIDGE.launch
+    if not launch:
+        raise ValueError("Nothing to close: browser_close only closes what browser_launch opened during this server run.")
+    notes: list[str] = []
+    report = None
+    if BRIDGE.launch_connected():
+        try:
+            report = await BRIDGE.call("browser_close_tab", {}, timeout=10)
+            notes.append("closed the agent's tab")
+        except Exception as exc:  # noqa: BLE001 - reported to the model
+            notes.append(f"could not close the agent's tab: {exc}")
+    else:
+        notes.append("the agent's tab was not connected any more (closed already?)")
+    others = report.get("remainingTabs") if isinstance(report, dict) else None
+
+    process = launch.get("process")
+    if launch.get("mode") != "own" or process is None:
+        BRIDGE.launch = None
+        audit("browser_close", "tab only (owner's Chrome)")
+        return "; ".join(notes) + ". Chrome was already running before browser_launch, so it was left alone."
+    if process.poll() is not None:
+        BRIDGE.launch = None
+        audit("browser_close", f"pid {launch.get('pid')} already exited")
+        return "; ".join(notes) + f". Chrome (PID {launch.get('pid')}) has already exited."
+    if not force and others != 0:
+        launch["released"] = True
+        why = (f"{others} other tab(s) are open in it" if others
+               else "it is unknown whether other tabs are open in it")
+        audit("browser_close", f"pid {launch.get('pid')} left running")
+        return ("; ".join(notes) + f". Chrome (PID {launch.get('pid')}) was left running: {why}. "
+                "Call browser_close(force=True) to end it anyway.")
+
+    # The last tab is gone: Chrome usually exits by itself (not on macOS).
+    exited = await wait_process_exit(process, BROWSER["closeTimeout"] if report else 0)
+    how = "exited by itself"
+    if not exited:
+        await asyncio.to_thread(end_process_tree, process, False)
+        exited, how = await wait_process_exit(process, 5), "asked to exit by PID"
+    if not exited:
+        await asyncio.to_thread(end_process_tree, process, True)
+        exited, how = await wait_process_exit(process, 5), "terminated by PID"
+    BRIDGE.launch = None
+    audit("browser_close", f"pid {launch.get('pid')} {how}", ok=exited)
+    if not exited:
+        return "; ".join(notes) + f". Chrome (PID {launch.get('pid')}) did not exit even after a forced stop."
+    return "; ".join(notes) + f". Chrome (PID {launch.get('pid')}) {how}."
+
+
+@mcp.tool()
+async def browser_navigate(url: str) -> str:
+    """Navigate the connected tab to a URL and return the page snapshot.
+
+    Args:
+        url: The URL to navigate to.
+    """
+    guard_browser_action()
+    refusal = navigation_refusal(url)
+    if refusal:
+        raise ValueError(f"Refusing to open {str(url).strip()[:100]}: {refusal}")
+    await BRIDGE.call("browser_navigate", {"url": url})
+    audit("browser_navigate", url)
+    return await page_snapshot()
+
+
+@mcp.tool()
+async def browser_go_back() -> str:
+    """Go back to the previous page and return the page snapshot."""
+    guard_browser_action()
+    await BRIDGE.call("browser_go_back", {})
+    return await page_snapshot()
+
+
+@mcp.tool()
+async def browser_go_forward() -> str:
+    """Go forward to the next page and return the page snapshot."""
+    guard_browser_action()
+    await BRIDGE.call("browser_go_forward", {})
+    return await page_snapshot()
+
+
+@mcp.tool()
+async def browser_wait(time: float) -> str:
+    """Wait for a specified time in seconds (at most 60).
+
+    Args:
+        time: The time to wait in seconds.
+    """
+    seconds = float(time)
+    if not 0 <= seconds <= BROWSER_MAX_WAIT:
+        raise ValueError(f"time must be finite and between 0 and {BROWSER_MAX_WAIT} seconds")
+    await asyncio.sleep(seconds)
+    return f"Waited for {seconds:g} seconds"
+
+
+@mcp.tool()
+async def browser_press_key(key: str) -> str:
+    """Press a key on the keyboard in the connected tab.
+
+    Args:
+        key: Name of the key to press or a character to generate, such as `ArrowLeft` or `a`.
+    """
+    guard_browser_action()
+    await BRIDGE.call("browser_press_key", {"key": key})
+    audit("browser_press_key", key)
+    return f"Pressed key {key}"
+
+
+@mcp.tool()
+async def browser_snapshot() -> str:
+    """Capture accessibility snapshot of the current page.
+
+    Use this for getting references (ref) to elements to interact with.
+    """
+    return await page_snapshot()
+
+
+@mcp.tool()
+async def browser_click(element: str, ref: str) -> str:
+    """Perform click on a web page and return the new snapshot.
+
+    Args:
+        element: Human-readable element description used to obtain permission to interact with the element.
+        ref: Exact target element reference from the page snapshot.
+    """
+    guard_browser_action()
+    await BRIDGE.call("browser_click", {"element": element, "ref": ref})
+    audit("browser_click", f"{element} [{ref}]")
+    return await page_snapshot(f'Clicked "{element}"')
+
+
+@mcp.tool()
+async def browser_drag(start_element: str, start_ref: str, end_element: str, end_ref: str) -> str:
+    """Perform drag and drop between two elements and return the new snapshot.
+
+    Args:
+        start_element: Human-readable source element description.
+        start_ref: Exact source element reference from the page snapshot.
+        end_element: Human-readable target element description.
+        end_ref: Exact target element reference from the page snapshot.
+    """
+    guard_browser_action()
+    await BRIDGE.call(
+        "browser_drag",
+        {
+            "startElement": start_element,
+            "startRef": start_ref,
+            "endElement": end_element,
+            "endRef": end_ref,
+        },
+    )
+    audit("browser_drag", f"{start_element} -> {end_element}")
+    return await page_snapshot(f'Dragged "{start_element}" to "{end_element}"')
+
+
+@mcp.tool()
+async def browser_hover(element: str, ref: str) -> str:
+    """Hover over element on page and return the new snapshot.
+
+    Args:
+        element: Human-readable element description used to obtain permission to interact with the element.
+        ref: Exact target element reference from the page snapshot.
+    """
+    guard_browser_action()
+    await BRIDGE.call("browser_hover", {"element": element, "ref": ref})
+    return await page_snapshot(f'Hovered over "{element}"')
+
+
+@mcp.tool()
+async def browser_type(element: str, ref: str, text: str, submit: bool = False) -> str:
+    """Type text into editable element and return the new snapshot.
+
+    Args:
+        element: Human-readable element description used to obtain permission to interact with the element.
+        ref: Exact target element reference from the page snapshot.
+        text: Text to type into the element.
+        submit: Whether to submit entered text (press Enter after).
+    """
+    guard_browser_action()
+    await BRIDGE.call(
+        "browser_type", {"element": element, "ref": ref, "text": text, "submit": bool(submit)}
+    )
+    # The typed text itself is not logged: it may be a password.
+    audit("browser_type", f"{element} [{ref}] ({len(text)} chars{', submit' if submit else ''})")
+    return await page_snapshot(f'Typed {len(text)} characters into "{element}"')
+
+
+@mcp.tool()
+async def browser_select_option(element: str, ref: str, values: list[str]) -> str:
+    """Select an option in a dropdown and return the new snapshot.
+
+    Args:
+        element: Human-readable element description used to obtain permission to interact with the element.
+        ref: Exact target element reference from the page snapshot.
+        values: Values to select in the dropdown: one value or several.
+    """
+    guard_browser_action()
+    await BRIDGE.call(
+        "browser_select_option", {"element": element, "ref": ref, "values": list(values)}
+    )
+    audit("browser_select_option", f"{element} [{ref}]")
+    return await page_snapshot(f'Selected option in "{element}"')
+
+
+@mcp.tool()
+async def browser_screenshot() -> Image:
+    """Take a screenshot of the current page."""
+    data = str(await BRIDGE.call("browser_screenshot", {}) or "")
+    if data.startswith("data:"):
+        data = data.split(",", 1)[-1]
+    try:
+        return Image(data=base64.b64decode(data), format="png")
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"The extension returned an unreadable screenshot: {exc}") from None
+
+
+@mcp.tool()
+async def browser_get_console_logs() -> str:
+    """Get the console logs from the connected tab."""
+    logs = await BRIDGE.call("browser_get_console_logs", {})
+    if not logs:
+        return "(no console messages)"
+    if not isinstance(logs, list):
+        logs = [logs]
+    return clamp("\n".join(json.dumps(item, ensure_ascii=False) for item in logs))
+
+
+# Local Access diagnostics v1: requires the companion unpacked extension.
+@mcp.tool()
+async def browser_diagnostics() -> str:
+    """Probe the selected tab's debugger and Runtime/Log subscriptions; report gaps and buffers."""
+    result = await BRIDGE.call("browser_diagnostics", {})
+    return json.dumps(result, ensure_ascii=False)
+
+
+@mcp.tool()
+async def browser_console(limit: int = 100, level: str = "all", clear: bool = False) -> str:
+    """Read structured console/exception/browser logs, or explicitly clear their in-memory buffer.
+
+    Args:
+        limit: Maximum messages, 1..500.
+        level: all, error, warning, info, log, debug, exception, navigation, or diagnostic.
+        clear: Clear captured console messages before returning. Requires writable mode.
+    """
+    if not 1 <= limit <= 500:
+        raise ValueError("limit must be 1..500")
+    if level not in {"all", "error", "warning", "info", "log", "debug", "exception", "navigation", "diagnostic"}:
+        raise ValueError("Unsupported console level")
+    if clear:
+        guard_browser_action()
+    result = await BRIDGE.call("browser_console", {"limit": limit, "level": level, "clear": clear})
+    return json.dumps(result, ensure_ascii=False)
+
+
+@mcp.tool()
+async def browser_network(action: str = "list", request_id: str = "", limit: int = 50,
+                          part: str = "response", max_chars: int = 16384) -> str:
+    """Opt-in bounded network diagnostics for the selected tab. No automatic body retrieval.
+
+    Args:
+        action: start, stop, clear, list, detail, or body. Capture is off by default.
+        request_id: Opaque ID returned by list, required for detail/body.
+        limit: Number of recent requests in list, 1..300.
+        part: request or response for body. Binary/expired bodies are not returned.
+        max_chars: Maximum returned body characters, 1..65536.
+
+    Query values and most headers are redacted; bodies use best-effort redaction,
+    NOT guaranteed anonymization. Use body only when needed for the user's task.
+    """
+    if action not in {"start", "stop", "clear", "list", "detail", "body"}:
+        raise ValueError("Invalid network action")
+    if not 1 <= limit <= 300 or not 1 <= max_chars <= 65536:
+        raise ValueError("limit must be 1..300 and max_chars 1..65536")
+    if part not in {"request", "response"}:
+        raise ValueError("part must be request or response")
+    if action in {"detail", "body"} and not request_id:
+        raise ValueError("request_id is required; list captured requests first")
+    if action in {"start", "stop", "clear"}:
+        guard_browser_action()
+    result = await BRIDGE.call("browser_network", {"action": action, "request_id": request_id,
+                              "limit": limit, "part": part, "max_chars": max_chars})
+    audit("browser_network", action)  # Never log headers, URLs, or returned bodies.
+    return json.dumps(result, ensure_ascii=False)
+
+
+@mcp.tool()
+async def browser_capture(mode: str = "viewport", scale: str = "original") -> Image:
+    """Capture a PNG of the viewport or full web page, not Chrome UI/DevTools.
+
+    Args:
+        mode: viewport or full_page.
+        scale: original (no forced downscaling) or reduced (fit within 1024x768).
+    """
+    if mode not in {"viewport", "full_page"} or scale not in {"original", "reduced"}:
+        raise ValueError("Invalid screenshot mode/scale")
+    data = await BRIDGE.call("browser_capture", {"mode": mode, "scale": scale})
+    if not isinstance(data, str) or len(data) > 32000000:
+        raise ValueError("Invalid/oversized screenshot payload")
+    try:
+        raw = base64.b64decode(data, validate=True)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"Unreadable screenshot payload: {exc}") from None
+    if not raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise ValueError("The extension did not return a PNG image")
+    return Image(data=raw, format="png")
+
+
+# DevTools protocol access: requires the Browser Control extension (extension/).
+# In READ_ONLY mode only CDP methods that read (get*/describe*/query*/search*/
+# resolve*) are allowed; evaluate and event subscriptions are actions.
+CDP_METHOD_RE = re.compile(r"^[A-Z][A-Za-z0-9]*\.[a-z][A-Za-z0-9]*$")
+CDP_READ_RE = re.compile(r"^[A-Z][A-Za-z0-9]*\.(get|describe|query|search|resolve)[A-Za-z0-9]*$")
+# Refused whatever the mode, also when READ_ONLY lets get* through: they reach
+# other sites, the whole browser or the local disk. Browser Control >= 1.0.3
+# refuses them as well; the copy here protects against older extensions.
+CDP_DENIED_DOMAINS = {"Browser", "Target", "SystemInfo", "Tethering", "Extensions", "PWA"}
+CDP_DENIED_METHODS = {
+    "Network.getAllCookies": "returns the cookies of every site in the browser",
+    "Network.clearBrowserCookies": "deletes the cookies of every site in the browser",
+    "Network.clearBrowserCache": "clears the cache of the whole browser",
+    "Network.loadNetworkResource": "loads any URL of any site, intranet or localhost past CORS",
+    "Storage.getCookies": "returns the cookies of every site in the browser",
+    "Storage.setCookies": "writes cookies of any site in the browser",
+    "Storage.clearCookies": "deletes the cookies of every site in the browser",
+    "Storage.clearDataForOrigin": "wipes storage of an arbitrary origin",
+    "Storage.clearDataForStorageKey": "wipes storage of an arbitrary origin",
+    "Page.close": "closes the tab",
+    "Page.crash": "crashes the renderer",
+}
+
+
+def cdp_refusal(method: str, params: dict) -> str:
+    """Why the server refuses a CDP command, or ""."""
+    domain = method.split(".", 1)[0]
+    if domain in CDP_DENIED_DOMAINS:
+        return f"the {domain} domain reaches beyond the connected tab"
+    if method in CDP_DENIED_METHODS:
+        return CDP_DENIED_METHODS[method]
+    if method == "Network.getCookies" and "urls" in params:
+        return "the urls parameter reads cookies of any site; call it without urls to get the cookies of this page"
+    if method == "Page.navigate":
+        reason = navigation_refusal(params.get("url", ""))
+        if reason:
+            return reason
+    return ""
+
+
+@mcp.tool()
+async def browser_cdp(method: str, params: dict | None = None) -> str:
+    """Send one Chrome DevTools Protocol command to the connected tab and return its JSON result.
+
+    Use it for what other browser_* tools do not cover, e.g. DOM.getDocument,
+    CSS.getComputedStyleForNode, Performance.getMetrics, Emulation.setDeviceMetricsOverride,
+    Network.getCookies. Browser.*, Target.* and other cross-tab domains are refused,
+    as are Runtime/Log/Page.disable (they would stop console capture), browser-wide
+    cookie/storage methods, Network.loadNetworkResource, cookies or storage of other
+    sites, and Page.navigate to chrome://, javascript: or file:// pages.
+
+    Args:
+        method: CDP method, Domain.command, e.g. "DOM.getDocument".
+        params: CDP parameters object, e.g. {"depth": 2}. Omit for none.
+    """
+    if not CDP_METHOD_RE.match(method or ""):
+        raise ValueError("method must look like Domain.command, e.g. DOM.getDocument")
+    if params is not None and not isinstance(params, dict):
+        raise ValueError("params must be a JSON object")
+    refusal = cdp_refusal(method, params or {})
+    if refusal:
+        raise ValueError(f"{method} is not allowed: {refusal}")
+    if READ_ONLY and not CDP_READ_RE.match(method):
+        raise ValueError(
+            "Server is running in READ_ONLY mode; only reading CDP methods "
+            "(get*, describe*, query*, search*, resolve*) are allowed."
+        )
+    result = await BRIDGE.call("browser_cdp", {"method": method, "params": params or {}})
+    audit("browser_cdp", method)  # params may hold page data: not logged
+    return clamp(json.dumps(result, ensure_ascii=False))
+
+
+@mcp.tool()
+async def browser_evaluate(expression: str, await_promise: bool = True) -> str:
+    """Run JavaScript in the connected tab (like the DevTools console) and return the result.
+
+    Top-level await works. The value comes back as JSON when serializable,
+    otherwise as a description; exceptions are returned, not raised.
+
+    Args:
+        expression: JavaScript to evaluate in the page, e.g. "document.title".
+        await_promise: Wait for a returned Promise to settle.
+    """
+    guard_browser_action()
+    if not (expression or "").strip():
+        raise ValueError("expression is required")
+    result = await BRIDGE.call(
+        "browser_evaluate", {"expression": expression, "awaitPromise": bool(await_promise)}
+    )
+    audit("browser_evaluate", f"{len(expression)} chars")  # the code itself is not logged
+    return clamp(json.dumps(result, ensure_ascii=False))
+
+
+@mcp.tool()
+async def browser_cdp_events(action: str = "read", domain: str = "", limit: int = 100) -> str:
+    """Subscribe to raw DevTools protocol events of a domain and read them back.
+
+    Args:
+        action: subscribe, unsubscribe, read or clear.
+        domain: CDP domain such as Performance, DOM, Animation; for read, optional filter.
+        limit: Events returned by read, 1..500 (newest last).
+    """
+    if action not in {"subscribe", "unsubscribe", "read", "clear"}:
+        raise ValueError("action must be subscribe, unsubscribe, read or clear")
+    if action in {"subscribe", "unsubscribe"} and not re.match(r"^[A-Z][A-Za-z0-9]*$", domain or ""):
+        raise ValueError("domain must be a CDP domain name, e.g. Performance")
+    if not 1 <= limit <= 500:
+        raise ValueError("limit must be 1..500")
+    if action != "read":
+        guard_browser_action()
+    result = await BRIDGE.call("browser_cdp_events", {"action": action, "domain": domain, "limit": limit})
+    audit("browser_cdp_events", f"{action} {domain}".strip())
+    return clamp(json.dumps(result, ensure_ascii=False))
+
+
+
 # --------------------------------------------------------- status banner ---
 
 
@@ -2279,12 +3351,22 @@ def main() -> None:
         f"  processes : adopted {STARTUP_REPORT['adopted']}, "
         f"cleaned {STARTUP_REPORT['cleaned']} old log(s)"
     )
-    print(f"  config    : {PERMISSIONS['source']}")
-    print(f"  perms     : defaultMode {PERMISSIONS['default']}")
+    config_note = "" if CONFIG_PATH.exists() else " (not found, built-in defaults)"
+    print(f"  config    : {CONFIG_PATH}{config_note}")
+    print(f"  perms     : defaultMode {PERMISSIONS['default']} ({PERMISSIONS['source']})")
     print(f"    allow : {', '.join(PERMISSIONS['raw']['allow']) or '-'}")
     print(f"    deny  : {', '.join(PERMISSIONS['raw']['deny']) or '-'}")
     commands = [entry for _, entry in PERMISSIONS["allowRun"]]
     print(f"    run   : {', '.join(commands) if commands else '- (no command is allowed)'}")
+    if not BROWSER["enabled"]:
+        print("  browser   : off")
+    elif BRIDGE.start():
+        print(
+            f"  browser   : ws://{BROWSER['host']}:{BROWSER['port']} "
+            "- press 'Connect' in the extension, or let the agent call browser_launch"
+        )
+    else:
+        print(f"  browser   : NOT started - {BRIDGE.error}")
     print("")
     if HOST not in ("127.0.0.1", "localhost", "::1"):
         print("  WARNING: the server is listening on the whole local network.")

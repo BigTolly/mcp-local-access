@@ -1,0 +1,12 @@
+{
+  "name": "browser-control",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Not an npm package: lets Node treat src/**/*.js as ES modules for the unit tests. Chrome ignores this file.",
+  "type": "module",
+  "scripts": {
+    "test": "node --test \"tests/*.test.mjs\"",
+    "icons": "node tools/make-icons.mjs",
+    "check": "node tools/check.mjs"
+  }
+}

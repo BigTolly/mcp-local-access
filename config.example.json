@@ -17,6 +17,20 @@
     "waitTimeoutSeconds": 600
   },
 
+  "browser": {
+    "enabled": true,
+    "host": "localhost",
+    "port": 9009,
+    "timeoutSeconds": 30,
+    "allowFileUrls": false,
+    "chromePath": "",
+    "userDataDir": "",
+    "profileDirectory": "",
+    "launchArgs": [],
+    "launchTimeoutSeconds": 30,
+    "closeTimeoutSeconds": 10
+  },
+
   "permissions": {
     "defaultMode": "allow",
     "allow": [

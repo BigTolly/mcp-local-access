@@ -35,6 +35,7 @@ MCP сервер — это «руки», облачный сервис — «м
 8. [Настройка через JSON на примере accio.com](#8-настройка-через-json-на-примере-acciocom)
 9. [Инструменты](#9-инструменты)
    - [Диалоговое окно](#Диалоговое-окно)
+   - [Управление браузером (Browser Control)](#управление-браузером-browser-control)
 10. [Rules.md — краткое описание вашего проекта](#10-rulesmd--краткое-описание-вашего-проекта)
 11. [Права доступа](#11-права-доступа)
 12. [Лимиты](#12-лимиты)
@@ -73,7 +74,7 @@ rootDir + явно разрешённые внешние папки Read/Write
 | `config.json` | файл настроек, создайте его из `config.example.json` |
 | `config.example.json` | шаблон настроек |
 | `.env` | файл хранит токен `MCP_TOKEN`, который генерируется при первом запуске `server.py` |
-| `requirements.txt` | три зависимости: `mcp`, `uvicorn`, `python-dotenv` |
+| `requirements.txt` | четыре зависимости: `mcp`, `uvicorn`, `python-dotenv`, `websockets` |
 | `README.md` | этот файл |
 | `Rules.md` | базовые инструкции для ИИ, чтобы ИИ знал минимальный контекст по вашему проекту |
 | `logs/` (внутри `rootDir`) | `cmd-NNN.log` — вывод команд, `audit.log` — журнал действий, `processes.json` — реестр процессов |
@@ -145,6 +146,27 @@ cp config.example.json config.json
 | `audit` | `false` выключает `logs/audit.log`. По умолчанию `true`. |
 | `maxCommandTimeout` | Верхняя граница `timeout` для `run_command`, в секундах. По умолчанию 600. |
 | `permissions` | Правила по путям и командам, см. раздел 11. |
+| `browser` | Мост к расширению Browser MCP, см. «Браузер (Browser MCP)» в разделе 9. Необязательный. |
+
+### Несколько файлов настроек
+
+По умолчанию читается `config.json`. Другой файл задаётся ключом `--config`
+(короткая форма `-c`). Путь указывать не нужно: файл всегда ищется в папке, где
+лежит `server.py`.
+
+```bat
+rem start.cmd
+start "MCP Server" cmd /k python C:\usr\mcp\local-access\server.py --config new.json
+```
+
+- Порядок выбора: `--config`, затем переменная `CONFIG_FILE`, затем `config.json`.
+- Файл, указанный через `--config`, обязан существовать — иначе сервер не
+  стартует с ошибкой `Config file not found`. Отсутствие `config.json` по
+  умолчанию, как и раньше, не ошибка.
+- Активный файл настроек всегда закрыт для модели, как бы он ни назывался:
+  правило `*(**/config.json)` не покрыло бы `new.json`. Неактивные запасные
+  конфиги защищайте сами, например `"*(**/new.json)"` в `deny`.
+- Имя активного файла сервер печатает при старте в строке `config`.
 
 В `.env` — только секретный токен:
 
@@ -186,6 +208,7 @@ python server.py
     allow : List(**), Read(**), Edit(**), Create(**), Delete(**)
     deny  : *(**/.env), *(**/.env.*), *(**/config.json), *(**/secrets/**)
     run   : Run(npm run dev), Run(npm run build), Run(git status)
+  browser   : ws://localhost:9009 - press 'Connect' in the Browser MCP extension
 
   WARNING: the server is listening on the whole local network.
   For a tighter setup set "host": "127.0.0.1" in config.json.
@@ -442,6 +465,112 @@ server {
 Когда время одного вызова истекает, инструмент возвращает `Call show-dialog-box again to continue waiting for the same window.` Агент должен вызвать его снова: продолжится ожидание **того же
 окна**, без дубликата и без потери набранного текста. Если ответ уже отправлен, следующий вызов заберёт сохранённый результат. Одновременно ожидающий второй вызов получает сообщение, что ожидание уже идёт.
 
+### Управление браузером (Browser Control)
+
+Инструменты MCP Local Access `browser_*` управляют **вашим** браузером, используя расширение Browser Control.
+`server.py` поднимает WebSocket на `ws://localhost:9009`, к которому подключается расширение.
+Браузер могут использовать облачные агенты и работать с сайтами под вашей авторизацией.
+
+**Как включить**
+
+1. Установите в Chrome расширение Browser Control.
+2. В браузере откройте нужную вкладку, нажмите на иконку Browser Control и кнопку **Connect this tab**.
+   Либо агент может сам открыть Chrome и подключить свою вкладку без дополнительных действий со стороны пользователя.
+
+| Инструмент | Что делает |
+| --- | --- |
+| `browser_status()` | Показывает, слушает ли сервер порт, подключена ли вкладка и есть ли агентская сессия; выводит расширенную диагностику |
+| `browser_launch(url)` | Запускает Chrome с вашим профилем и подключает вкладку агента без Connect |
+| `browser_close(force)` | Закрывает вкладку агента; Chrome, запущенный агентом, завершает по PID |
+| `browser_navigate(url)` | Открывает URL, возвращает снимок страницы |
+| `browser_go_back()` / `browser_go_forward()` | Назад / вперёд по истории |
+| `browser_snapshot()` | ARIA-снимок страницы с `ref` элементов |
+| `browser_click(element, ref)` | Клик по элементу |
+| `browser_hover(element, ref)` | Наведение на элемент |
+| `browser_drag(start_element, start_ref, end_element, end_ref)` | Перетаскивание |
+| `browser_type(element, ref, text, submit)` | Ввод текста, `submit=true` — Enter после |
+| `browser_select_option(element, ref, values)` | Выбор в выпадающем списке |
+| `browser_press_key(key)` | Нажатие клавиши, например `Enter`, `ArrowLeft` |
+| `browser_wait(time)` | Пауза в секундах, отклоняет отрицательные, бесконечные и превышающие 60 секунд значения |
+| `browser_screenshot()` | Скриншот вкладки (PNG) |
+| `browser_get_console_logs()` | Возвращает логи и структурированную информацию о состоянии их сбора |
+| `browser_cdp(method, params)` | Одна команда Chrome DevTools Protocol для подключённой вкладки (`DOM.getDocument`, `Performance.getMetrics`, ...). `Browser.*`, `Target.*` и отключение Runtime/Log/Page запрещены, как и куки/хранилище всего браузера и `Network.loadNetworkResource` |
+| `browser_evaluate(expression, await_promise)` | JavaScript в странице, как в консоли DevTools; возвращает значение или исключение |
+| `browser_cdp_events(action, domain, limit)` | Подписка на события домена CDP (`subscribe/unsubscribe/read/clear`) |
+| `browser_diagnostics()` | Реальная проверка debugger, подписок, ошибок и потерь сбора |
+| `browser_console(limit, level, clear)` | Console API, исключения и браузерные Log-сообщения; очистка только явно |
+| `browser_network(action, request_id, limit, part, max_chars)` | `start/stop/clear/list/detail/body`; сеть выключена по умолчанию |
+| `browser_capture(mode, scale)` | `viewport/full_page`, `original/reduced`; PNG веб-страницы, не всего окна Chrome |
+
+Сценарий для модели: `browser_snapshot` → взять `ref` нужного элемента → `browser_click` / `browser_type`. Действия возвращают свежий снимок страницы.
+
+В `readOnly` у `browser_cdp` разрешены только читающие методы (`get*`, `describe*`, `query*`, `search*`, `resolve*`); `browser_evaluate` и подписки запрещены. В журнал аудита записываются только имя метода и длина выражения, но не параметры и не код.
+
+Сервер отказывает в методах, которые выходят за пределы вкладки (`CDP_DENIED_DOMAINS` / `CDP_DENIED_METHODS` в `server.py`): `Browser.*`, `Target.*`, `Network.getAllCookies`, `Storage.getCookies/setCookies/clearCookies`, `Network.clearBrowserCookies/clearBrowserCache`, `Storage.clearDataFor*`, `Network.loadNetworkResource`, `Network.getCookies` с `urls`, `Page.close/crash`, а также `Page.navigate` на `javascript:` и, по умолчанию, на `file://` (если `browser.allowFileUrls` не установлен в `true`). Browser Control дополнительно ограничивает `Network.setCookie(s)/deleteCookies` и методы с `origin`/`securityOrigin`/`storageKey` сайтом текущей вкладки.
+
+
+**Настройка MCP Local Access** (необязательно; ниже приведены значения по умолчанию):
+
+```json
+"browser": {
+  "enabled": true,
+  "host": "localhost",
+  "port": 9009,
+  "timeoutSeconds": 30,
+  "allowFileUrls": false,
+  "chromePath": "",
+  "userDataDir": "",
+  "profileDirectory": "",
+  "launchArgs": [],
+  "launchTimeoutSeconds": 30,
+  "closeTimeoutSeconds": 10
+}
+```
+
+| Ключ | Значение |
+| --- | --- |
+| `enabled` | `false` отключает мост: порт не слушается, инструменты отвечают отказом |
+| `host` | Интерфейс WebSocket. `localhost` — только эта машина; наружу не открывайте |
+| `port` | Порт, к которому подключается расширение. Browser MCP знает только `9009`; в Browser Control порт меняется в popup |
+| `timeoutSeconds` | Сколько ждать ответа расширения на одну команду |
+| `allowFileUrls` | По умолчанию `false`: сервер запрещает переходы на `file://` через `browser_navigate` / `browser_cdp Page.navigate`. Для разрешения доступа необходимо установить `browser.allowFileUrls` в `true` в `config.json`, **а также** установить флажок «Allow file:// pages» во всплывающем окне Browser Control и разрешить расширению «Доступ к URL файлов» в настройках Chrome. Эти разрешения дополняют, а не заменяют друг друга. Такой доступ позволяет агенту читать **любой доступный браузеру файл компьютера** в обход `rootDir` и правил Deny |
+| `chromePath` | `browser_launch`: путь к `chrome.exe` / `Google Chrome`. Пусто: ищется сам (реестр App Paths, Program Files, LocalAppData; `/Applications`; `google-chrome`/`chromium` в PATH) |
+| `userDataDir` | `browser_launch`: `--user-data-dir`. Пусто: ваш обычный профиль (сайты остаются залогинены) |
+| `profileDirectory` | `browser_launch`: `--profile-directory`, например `Profile 1`. Пусто: профиль по умолчанию |
+| `launchArgs` | `browser_launch`: дополнительные флаги Chrome (список строк) |
+| `launchTimeoutSeconds` | Сколько секунд `browser_launch` ждёт подключения расширения (минимум 5) |
+| `closeTimeoutSeconds` | Сколько `browser_close` ждёт, пока Chrome закроется сам после закрытия последней вкладки, прежде чем завершать его по PID |
+
+**Важно**
+
+- В режиме `readOnly` доступны чтение страницы, снимки и чтение диагностики.
+  Действия браузера, очистка журналов и включение/выключение сетевого сбора запрещены.
+- В `logs/audit.log` записываются переходы, клики и события ввода; сам введённый текст не записывается (это может быть пароль) — только его длина.
+- Браузер не входит в песочницу `rootDir`: агент видит всё, что открыто в подключённой вкладке, и действует от вашего имени.
+- Для `browser_navigate` и `Page.navigate` сервер всегда запрещает переходы на `javascript:`, а на `file://` — только при `browser.allowFileUrls=false` (значение по умолчанию). Разрешение на сервере не отменяет отдельные ограничения Browser Control и Chrome.
+
+
+### Агентский браузер: `browser_launch` / `browser_close`
+
+Установить расширение Browser Control может только пользователь.
+Агент может сам открыть Chrome и подключить свою вкладку.
+Если `userDataDir` пуст, Chrome запускается с вашим профилем и может открывать сайты под вашей учётной записью.
+
+Варианты запуска Chrome:
+- Chrome не запущен: агент запускает его, а после работы закрывает свою вкладку. Если других открытых вкладок нет, агент завершает Chrome по PID.
+- Chrome уже открыт: новая **вкладка** открывается в последнем активном окне, а по завершении работы агент закрывает только свою вкладку.
+
+Для работы с браузером вкладка агента не обязана быть активной.
+Агент может получать снимки страницы, нажимать на элементы, переходить по ссылкам и делать скриншоты даже в свёрнутом окне.
+Страница при этом «спит», и её обновления происходят медленнее.
+
+Сбор ограничен основной CDP-целью выбранной вкладки; дочерние CDP-сессии не агрегируются.
+Журналы хранятся в памяти и теряются при перезапуске worker, отключении или смене вкладки.
+
+Большие снимки ограничены 20 000 пикселей по стороне и бюджетом 32 млн пикселей
+с учётом DPR/масштаба; возможны ограничения конкретного Chrome, sticky и lazy loading.
+Перед выпуском требуется фактическая проверка в Chrome: mock-тесты её не заменяют.
+
 ## 10. Rules.md — краткое описание вашего проекта
 
 `Rules.md` — (опционально) необязательный файл, кратко опишите свой проект,
@@ -684,6 +813,10 @@ python -m unittest discover -s tests -v
 | Симптом | Причина |
 | --- | --- |
 | `rootDir is not set` | Нет `config.json` или в нём не задан `rootDir` |
+| `Config file not found` | Файла из `--config` нет в папке `server.py` |
+| `browser : NOT started - port 9009 is busy` | Порт занят другим Browser MCP (`npx @browsermcp/mcp`); закройте его |
+| `No connection to the browser extension` | Во вкладке не нажат **Connect** в расширении Browser MCP |
+| `the active config file is protected` | Модель обратилась к активному файлу настроек — он закрыт всегда |
 | 401 от клиента | Токен не совпадает или заголовок называется не `Authorization` |
 | 421 `Invalid Host header` | Старый `server.py` без перезаписи `Host` |
 | 406 Not Acceptable | Клиент не отправил заголовок `Accept`, показанный в разделе 8 |
@@ -710,13 +843,18 @@ python -m unittest discover -s tests -v
 - Указать общую родительскую папку и сузить доступ правами, например
   `List(project-a/**)`, `Read(project-a/**)`, `Edit(project-a/**)` и то же для
   `project-b`. Просто и работает, но всё лежит в одной песочнице.
-- Запустить второй экземпляр сервера со своим конфигом и портом: путь к конфигу
-  берётся из переменной `CONFIG_FILE`, а порт — из самого конфига.
+- Запустить второй экземпляр сервера со своим конфигом и портом: конфиг
+  задаётся ключом `--config` (файл ищется рядом с `server.py`) или переменной
+  `CONFIG_FILE`, а порт — в самом конфиге.
 
   ```bash
+  python server.py --config config-b.json
   CONFIG_FILE=/path/to/config-b.json python server.py     # macOS / Linux
   set CONFIG_FILE=C:\path\to\config-b.json && python server.py   # Windows
   ```
+
+  Мост к браузеру может работать только в одном экземпляре (порт `9009` один):
+  в остальных поставьте `"browser": { "enabled": false }`.
 
   Каждому экземпляру нужен свой публичный адрес (второй туннель или второй
   `location` в Nginx) и своё подключение в клиенте. Токен берётся из `.env`

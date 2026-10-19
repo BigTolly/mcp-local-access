@@ -33,6 +33,7 @@ tested only on Windows; the macOS/Linux branches are written but not verified.
 8. [JSON setup, using accio.com as an example](#8-json-setup-using-acciocom-as-an-example)
 9. [Tools](#9-tools)
    - [Dialog box](#Dialog-box)
+   - [Browser control (Browser Control)](#browser-control-browser-control)
 10. [Rules.md — a short description of your project](#10-rulesmd--a-short-description-of-your-project)
 11. [Permissions](#11-permissions)
 12. [Limits](#12-limits)
@@ -70,7 +71,7 @@ ended up on the internet is the business of the tunnel or the proxy.
 | `config.json` | the settings file, create it from `config.example.json` |
 | `config.example.json` | settings template |
 | `.env` | the file stores the `MCP_TOKEN` token, which is generated on the first run of `server.py` |
-| `requirements.txt` | three dependencies: `mcp`, `uvicorn`, `python-dotenv` |
+| `requirements.txt` | four dependencies: `mcp`, `uvicorn`, `python-dotenv`, `websockets` |
 | `README.md` | this file |
 | `Rules.md` | basic instructions for the AI, so that it knows the minimal context of your project |
 | `logs/` (inside `rootDir`) | `cmd-NNN.log` — command output, `audit.log` — action journal, `processes.json` — process registry |
@@ -142,6 +143,25 @@ cp config.example.json config.json
 | `audit` | `false` turns off `logs/audit.log`. `true` by default. |
 | `maxCommandTimeout` | Upper bound for the `timeout` of `run_command`, in seconds. 600 by default. |
 | `permissions` | Rules for paths and commands, see section 11. |
+| `browser` | Bridge to the Browser MCP extension, see "Browser (Browser MCP)" in section 9. Optional. |
+
+### Several config files
+
+`config.json` is read by default. Pick another file with `--config` (short form
+`-c`). No path is needed: the file is always looked up in the folder of `server.py`.
+
+```bat
+rem start.cmd
+start "MCP Server" cmd /k python C:\usr\mcp\local-access\server.py --config new.json
+```
+
+- Precedence: `--config`, then the `CONFIG_FILE` variable, then `config.json`.
+- A file named with `--config` must exist, otherwise the server stops with
+  `Config file not found`. A missing default `config.json` is still fine.
+- The active config is always closed to the model, whatever its name: the rule
+  `*(**/config.json)` would not cover `new.json`. Protect inactive spare configs
+  yourself, e.g. `"*(**/new.json)"` in `deny`.
+- The server prints the active file on start in the `config` line.
 
 `.env` holds only the secret token:
 
@@ -183,6 +203,7 @@ It prints the endpoint, the token and the effective rules:
     allow : List(**), Read(**), Edit(**), Create(**), Delete(**)
     deny  : *(**/.env), *(**/.env.*), *(**/config.json), *(**/secrets/**)
     run   : Run(npm run dev), Run(npm run build), Run(git status)
+  browser   : ws://localhost:9009 - press 'Connect' in the extension, or let the agent call browser_launch
 
   WARNING: the server is listening on the whole local network.
   For a tighter setup set "host": "127.0.0.1" in config.json.
@@ -439,6 +460,112 @@ is absent, the instructions are enabled.
 When a call's waiting period expires, the tool returns `Call show-dialog-box again to continue waiting for the same window.` The agent must call it again: it will resume waiting for **the same
 window**, without a duplicate or loss of the text already entered. If the response has already been submitted, the next call retrieves the saved result. A second concurrent waiting call receives a message that waiting is already in progress.
 
+### Browser control (Browser Control)
+
+The MCP Local Access `browser_*` tools control **your** browser through the Browser Control extension.
+`server.py` starts a WebSocket server at `ws://localhost:9009`, which the extension connects to.
+Cloud agents can use the browser and work with websites where you are already signed in.
+
+**How to enable it**
+
+1. Install the Browser Control extension in Chrome.
+2. Open the tab you want to use, click the Browser Control icon, and click **Connect this tab**.
+   Alternatively, the agent can open Chrome and connect to it automatically, with no additional user actions.
+
+| Tool | What it does |
+| --- | --- |
+| `browser_status()` | Reports whether the server is listening on the port, whether a tab is connected, and whether an agent session exists; provides extended diagnostics |
+| `browser_launch(url)` | Launches Chrome with your profile and connects the agent's tab without clicking Connect |
+| `browser_close(force)` | Closes the agent's tab; terminates Chrome by PID if it was launched by the agent |
+| `browser_navigate(url)` | Opens a URL and returns a page snapshot |
+| `browser_go_back()` / `browser_go_forward()` | Goes back / forward in browsing history |
+| `browser_snapshot()` | Returns an ARIA snapshot of the page with element `ref` values |
+| `browser_click(element, ref)` | Clicks an element |
+| `browser_hover(element, ref)` | Hovers over an element |
+| `browser_drag(start_element, start_ref, end_element, end_ref)` | Drags and drops an element |
+| `browser_type(element, ref, text, submit)` | Types text; `submit=true` presses Enter afterwards |
+| `browser_select_option(element, ref, values)` | Selects an option in a dropdown |
+| `browser_press_key(key)` | Presses a key, such as `Enter` or `ArrowLeft` |
+| `browser_wait(time)` | Pauses for the specified number of seconds; rejects negative, infinite, and greater-than-60-second values |
+| `browser_screenshot()` | Takes a screenshot of the tab (PNG) |
+| `browser_get_console_logs()` | Returns structured information about collection health along with the logs |
+| `browser_cdp(method, params)` | Sends one Chrome DevTools Protocol command to the connected tab (`DOM.getDocument`, `Performance.getMetrics`, ...). `Browser.*`, `Target.*`, and disabling Runtime/Log/Page are prohibited, as are browser-wide cookies/storage and `Network.loadNetworkResource` |
+| `browser_evaluate(expression, await_promise)` | Runs JavaScript in the page, as in the DevTools console; returns a value or an exception |
+| `browser_cdp_events(action, domain, limit)` | Subscribes to CDP domain events (`subscribe/unsubscribe/read/clear`) |
+| `browser_diagnostics()` | Performs a live check of the debugger, subscriptions, errors, and collection losses |
+| `browser_console(limit, level, clear)` | Returns Console API messages, exceptions, and browser Log messages; clears them only when explicitly requested |
+| `browser_network(action, request_id, limit, part, max_chars)` | `start/stop/clear/list/detail/body`; network collection is disabled by default |
+| `browser_capture(mode, scale)` | `viewport/full_page`, `original/reduced`; captures a PNG of the web page, not the entire Chrome window |
+
+Typical model workflow: `browser_snapshot` → take the target element's `ref` → `browser_click` / `browser_type`. Actions return a fresh page snapshot.
+
+In `readOnly` mode, `browser_cdp` allows only read methods (`get*`, `describe*`, `query*`, `search*`, `resolve*`); `browser_evaluate` and subscriptions are prohibited. The audit log records only the method name and expression length, not parameters or code.
+
+The server rejects methods that go beyond the tab's scope (`CDP_DENIED_DOMAINS` / `CDP_DENIED_METHODS` in `server.py`): `Browser.*`, `Target.*`, `Network.getAllCookies`, `Storage.getCookies/setCookies/clearCookies`, `Network.clearBrowserCookies/clearBrowserCache`, `Storage.clearDataFor*`, `Network.loadNetworkResource`, `Network.getCookies` with `urls`, `Page.close/crash`, and `Page.navigate` to `javascript:` or, by default, `file://` (unless `browser.allowFileUrls` is set to `true`). Browser Control additionally restricts `Network.setCookie(s)/deleteCookies` and methods with `origin`/`securityOrigin`/`storageKey` to the current tab's site.
+
+
+**MCP Local Access configuration** (optional; default values shown below):
+
+```json
+"browser": {
+  "enabled": true,
+  "host": "localhost",
+  "port": 9009,
+  "timeoutSeconds": 30,
+  "allowFileUrls": false,
+  "chromePath": "",
+  "userDataDir": "",
+  "profileDirectory": "",
+  "launchArgs": [],
+  "launchTimeoutSeconds": 30,
+  "closeTimeoutSeconds": 10
+}
+```
+
+| Key | Meaning |
+| --- | --- |
+| `enabled` | `false` disables the bridge: the port is not listened on and the tools refuse requests |
+| `host` | WebSocket interface. `localhost` means this machine only; do not expose it externally |
+| `port` | The port the extension connects to. Browser MCP only supports `9009`; in Browser Control, the port can be changed in the popup |
+| `timeoutSeconds` | How long to wait for the extension's response to a single command |
+| `allowFileUrls` | Defaults to `false`: the server blocks navigation to `file://` URLs through `browser_navigate` / `browser_cdp Page.navigate`. To allow access, set `browser.allowFileUrls` to `true` in `config.json`, **and also** enable “Allow file:// pages” in the Browser Control popup and “Allow access to file URLs” for the extension in Chrome's settings. These permissions are cumulative, not alternatives. This access lets the agent read **any file on the computer that the browser can access**, bypassing `rootDir` and Deny rules |
+| `chromePath` | `browser_launch`: path to `chrome.exe` / `Google Chrome`. If empty, Chrome is located automatically (App Paths registry, Program Files, LocalAppData; `/Applications`; `google-chrome`/`chromium` in PATH) |
+| `userDataDir` | `browser_launch`: `--user-data-dir`. If empty, your regular profile is used (websites stay signed in) |
+| `profileDirectory` | `browser_launch`: `--profile-directory`, for example `Profile 1`. If empty, the default profile is used |
+| `launchArgs` | `browser_launch`: additional Chrome flags (a list of strings) |
+| `launchTimeoutSeconds` | How long `browser_launch` waits for the extension to connect (minimum 5 seconds) |
+| `closeTimeoutSeconds` | How long `browser_close` waits for Chrome to exit on its own after the last tab is closed, before terminating it by PID |
+
+**Important**
+
+- In `readOnly` mode, reading pages, taking snapshots/screenshots, and reading diagnostics are available.
+  Browser actions, clearing logs, and starting/stopping network collection are prohibited.
+- `logs/audit.log` records navigation, clicks, and typing; the entered text itself is not recorded (it may be a password) — only its length.
+- The browser is outside the `rootDir` sandbox: the agent sees everything open in the connected tab and acts on your behalf.
+- For `browser_navigate` and `Page.navigate`, the server always blocks `javascript:` URLs and blocks `file://` URLs only when `browser.allowFileUrls=false` (the default). Server-side permission does not override the separate restrictions in Browser Control and Chrome.
+
+
+### Agent browser: `browser_launch` / `browser_close`
+
+Only the user can install the Browser Control extension.
+The agent can open Chrome and connect its own tab automatically.
+Chrome launches with your profile (when `userDataDir` is empty) and can access websites using your signed-in account.
+
+Chrome launch scenarios:
+- Chrome is not running: the agent starts it and closes its tab when finished. If no other tabs are open, it terminates Chrome by PID.
+- Chrome is already open: a new **tab** opens in the most recently active window; when finished, the agent closes only its own tab.
+
+The agent's tab does not need to be active for browser control to work.
+The agent can take snapshots, click, navigate, and take screenshots even in a minimized window.
+However, the page “sleeps” in this state, so page updates happen more slowly.
+
+Collection is limited to the selected tab's main CDP target; child CDP sessions are not aggregated.
+Logs are kept in memory and are lost when the worker restarts, the connection is closed, or the selected tab changes.
+
+Large captures are limited to 20,000 pixels per side and a budget of 32 million pixels,
+accounting for DPR/scale; Chrome-specific limitations, sticky elements, and lazy loading may affect the result.
+A real Chrome check is required before release: mock tests are not a substitute.
+
 ## 10. Rules.md — a short description of your project
 
 `Rules.md` is an (optional) file; describe your project briefly in it,
@@ -676,6 +803,10 @@ Hardcoded in `server.py` (constants at the top of the file), changed by editing 
 | Symptom | Cause |
 | --- | --- |
 | `rootDir is not set` | There is no `config.json`, or `rootDir` is not set in it |
+| `Config file not found` | The `--config` file is not in the folder of `server.py` |
+| `browser : NOT started - port 9009 is busy` | Another Browser MCP (`npx @browsermcp/mcp`) holds the port; close it |
+| `No connection to the browser extension` | **Connect** was not pressed in the extension; or let the agent call `browser_launch` |
+| `the active config file is protected` | The model touched the active config file, which is always closed |
 | 401 from the client | The token does not match, or the header is not named `Authorization` |
 | 421 `Invalid Host header` | An old `server.py` without the `Host` rewrite |
 | 406 Not Acceptable | The client did not send the `Accept` header shown in section 8 |
@@ -706,6 +837,7 @@ One process — one main root. For specific external directories, add absolute
   is taken from the `CONFIG_FILE` variable, and the port — from the config itself.
 
   ```bash
+  python server.py --config config-b.json
   CONFIG_FILE=/path/to/config-b.json python server.py     # macOS / Linux
   set CONFIG_FILE=C:\path\to\config-b.json && python server.py   # Windows
   ```
